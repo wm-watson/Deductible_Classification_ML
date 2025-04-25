@@ -185,11 +185,14 @@ df_clean['family_size_matches_members'] = (df_clean['family_size'] == df_clean['
 # Company-specific
 company_deductible_types = df_clean.groupby(['COMPANY_KEY', 'Plan_year'])['deductible_types'].nunique().reset_index()
 company_deductible_types.rename(columns={'deductible_types': 'company_deductible_types_count'}, inplace=True)
+
+# Add merge check
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(company_deductible_types, on=['COMPANY_KEY', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Flag companies with multiple deductible types in same year
 df_clean['company_has_multiple_deductible_types'] = (df_clean['company_deductible_types_count'] > 1).astype(int)
-
 
 ######## Part 2. Financial Ratios & Patterns      ############################
 
@@ -210,8 +213,10 @@ df_clean['has_deductible'] = (df_clean['DEDUCTIBLEAMOUNT'] > 0).astype(int)
 member_deductibles = df_clean.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
 member_deductibles.rename(columns={'DEDUCTIBLEAMOUNT': 'member_total_deductible'}, inplace=True)
 
-# Merge back to main dataframe
+# Check row count before and after merge
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(member_deductibles, on=['MVDID', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Calculate average financials per claim
 claim_financials = df_clean.groupby('CLAIMNUMBER').agg({
@@ -229,10 +234,13 @@ claim_financials['claim_patient_share'] = claim_financials['claim_patient_respon
 
 # Keep cal columns
 claim_financials = claim_financials[['CLAIMNUMBER', 'claim_deductible_to_allowed_ratio', 'claim_patient_responsibility', 'claim_patient_share']]
+
+# Add merge check for claim financials
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(claim_financials, on='CLAIMNUMBER', how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
-
-######## Part 2. Time-based Feature Construction#########################
+######## Part 3. Time-based Feature Construction#########################
 
 # Extract time-based features
 df_clean['service_year'] = df_clean['SERVICEFROMDATE'].dt.year
@@ -258,7 +266,11 @@ df_clean['first_coinsurance'] = (df_clean['cumulative_coinsurance'] == 1) & (df_
 # Flag if member ever has coinsurance in the plan year
 member_has_coins = df_clean.groupby(['MVDID', 'Plan_year'])['has_coinsurance'].max().reset_index()
 member_has_coins.rename(columns={'has_coinsurance': 'ever_has_coinsurance'}, inplace=True)
+
+# Add merge check here
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(member_has_coins, on=['MVDID', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # For members who have coinsurance, calculate deductible before first coinsurance
 before_coinsurance = df_clean.loc[
@@ -271,8 +283,11 @@ if len(before_coinsurance) > 0:
     deduct_before_coins = before_coinsurance.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
     deduct_before_coins.rename(columns={'DEDUCTIBLEAMOUNT': 'deductible_before_coinsurance'}, inplace=True)
 
+    # Add merge check here
+    row_count_before = len(df_clean)
     # Merge back
     df_clean = df_clean.merge(deduct_before_coins, on=['MVDID', 'Plan_year'], how='left')
+    assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 else:
     df_clean['deductible_before_coinsurance'] = np.nan
 
@@ -282,8 +297,11 @@ if len(no_coins_members) > 0:
     no_coins_deduct = no_coins_members.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
     no_coins_deduct.rename(columns={'DEDUCTIBLEAMOUNT': 'no_coins_total_deductible'}, inplace=True)
 
+    # Add merge check here
+    row_count_before = len(df_clean)
     # Merge back
     df_clean = df_clean.merge(no_coins_deduct, on=['MVDID', 'Plan_year'], how='left')
+    assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
     # Fill in deductible_before_coinsurance with total deductible for no-coinsurance members
     df_clean.loc[df_clean['ever_has_coinsurance'] == 0, 'deductible_before_coinsurance'] = df_clean[
@@ -315,9 +333,10 @@ if calc_mask.any():
 # Keep only the columns we need
 member_deduct_ratio = member_deduct_ratio[['MVDID', 'Plan_year', 'deductible_before_coins_ratio']]
 
-# Merge back to the main dataframe
+# Merge back to the main dataframe with check
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(member_deduct_ratio, on=['MVDID', 'Plan_year'], how='left')
-
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 df_clean.info()
 
 ######## Part 4: Individual-to-Family Contribution Analysis #########################
@@ -327,16 +346,20 @@ df_clean.info()
 member_fam_deduct = df_clean.groupby(['family_id', 'MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
 member_fam_deduct.rename(columns={'DEDUCTIBLEAMOUNT': 'member_fam_deduct_amount'}, inplace=True)
 
+row_count_before = len(df_clean)
 # Merge back to get individual contribution
 df_clean = df_clean.merge(member_fam_deduct, on=['family_id', 'MVDID', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Calculate family total deductible (ensuring we avoid duplicates)
 family_deduct_temp = member_fam_deduct.groupby(['family_id', 'Plan_year'])[
     'member_fam_deduct_amount'].sum().reset_index()
 family_deduct_temp.rename(columns={'member_fam_deduct_amount': 'fam_total_deduct_amount'}, inplace=True)
 
+row_count_before = len(df_clean)
 # Merge family totals
 df_clean = df_clean.merge(family_deduct_temp, on=['family_id', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Step 2: Calculate family contribution metrics
 # Calculate member's contribution percentage to family deductible
@@ -346,7 +369,11 @@ df_clean['member_deduct_contribution_pct'] = df_clean['member_fam_deduct_amount'
 # Calculate the max individual deductible within family
 family_max = member_fam_deduct.groupby(['family_id', 'Plan_year'])['member_fam_deduct_amount'].max().reset_index()
 family_max.rename(columns={'member_fam_deduct_amount': 'family_max_member_deduct'}, inplace=True)
+
+# Add merge check here
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(family_max, on=['family_id', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 
 # Calculate variation metrics - using a function to avoid repetitive calculations
@@ -395,7 +422,11 @@ def calc_family_deduct_stats(x):
 # Calculate the statistics at the family-year level
 family_stats = member_fam_deduct.groupby(['family_id', 'Plan_year'])['member_fam_deduct_amount'].apply(
     calc_family_deduct_stats).reset_index()
+
+# Add merge check here
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(family_stats, on=['family_id', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Step 3: Calculate additional family structure metrics
 # Ratio of max individual deductible to family total
@@ -442,7 +473,11 @@ def calc_concentration(group):
 
 # Apply to each family-year
 family_concentration = member_fam_deduct.groupby(['family_id', 'Plan_year']).apply(calc_concentration).reset_index()
+
+# Add merge check here
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(family_concentration, on=['family_id', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Step 5: Calculate features related to deductible payment patterns
 # For aggregate deductibles, we might see family members waiting until one member meets most of the deductible
@@ -457,9 +492,14 @@ member_first_deduct.rename(columns={'SERVICEFROMDATE': 'first_deduct_date'}, inp
 family_first_deduct = member_first_deduct.groupby(['family_id', 'Plan_year'])['first_deduct_date'].min().reset_index()
 family_first_deduct.rename(columns={'first_deduct_date': 'family_first_deduct_date'}, inplace=True)
 
+row_count_before = len(df_clean)
 # Merge both back
 df_clean = df_clean.merge(member_first_deduct, on=['family_id', 'MVDID', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(family_first_deduct, on=['family_id', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Calculate days between family's first deductible and member's first deductible
 df_clean['days_after_family_first_deduct'] = (
@@ -479,14 +519,23 @@ def calc_date_variance(dates):
 family_date_var = member_first_deduct.groupby(['family_id', 'Plan_year'])['first_deduct_date'].apply(
     lambda x: calc_date_variance(x)).reset_index()
 family_date_var.rename(columns={'first_deduct_date': 'family_deduct_date_variance'}, inplace=True)
+
+# Add merge check here
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(family_date_var, on=['family_id', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Step 6: Create features based on family member utilization patterns
 # Calculate what percentage of family members have deductible payments
 family_member_with_deduct = member_fam_deduct[member_fam_deduct['member_fam_deduct_amount'] > 0].groupby(
     ['family_id', 'Plan_year']).size().reset_index()
 family_member_with_deduct.rename(columns={0: 'members_with_deduct'}, inplace=True)
+
+# Add merge check here
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(family_member_with_deduct, on=['family_id', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+
 df_clean['pct_family_with_deduct'] = df_clean['members_with_deduct'] / df_clean['family_size']
 
 # Fill NAs with appropriate values for all created columns
@@ -496,7 +545,7 @@ for col in deduct_cols:
     if col.startswith('pct_') or col.endswith('_ratio') or col.endswith('_share'):
         df_clean[col] = df_clean[col].fillna(0)
 
-##### Part 5. MULTI-Year Analysis Features######
+######## Part 5. MULTI-Year Analysis Features######
 
 # Calculate consistency of deductible structure for each member across years
 yearly_deductibles = df_clean.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
@@ -504,7 +553,11 @@ yearly_deductibles = df_clean.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'
 # Calculate variation across years for the same member
 member_years = yearly_deductibles.groupby('MVDID')['Plan_year'].count().reset_index()
 member_years.rename(columns={'Plan_year': 'member_years_in_data'}, inplace=True)
+
+# Merge check
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(member_years, on='MVDID', how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Only calculate year-over-year metrics for members with multiple years
 multi_year_members = yearly_deductibles[yearly_deductibles['MVDID'].isin(
@@ -520,8 +573,10 @@ if len(multi_year_members) > 0:
         'deduct_mean'].replace(0, np.nan)
     member_year_variation = member_year_variation[['MVDID', 'year_over_year_variation']]
 
-    # Merge back
+    # Merge check
+    row_count_before = len(df_clean)
     df_clean = df_clean.merge(member_year_variation, on='MVDID', how='left')
+    assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 else:
     df_clean['year_over_year_variation'] = np.nan
 
@@ -532,8 +587,10 @@ deduct_type_by_year = df_clean.groupby(['MVDID', 'Plan_year'])['deductible_types
 member_deduct_types = deduct_type_by_year.groupby('MVDID')['deductible_types'].nunique().reset_index()
 member_deduct_types.rename(columns={'deductible_types': 'deductible_type_changes'}, inplace=True)
 
-# Merge back - higher values may indicate plan changes
+# Merge check
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(member_deduct_types, on='MVDID', how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Flag if this year's deductible type is different from previous year for this member
 deduct_type_by_year = deduct_type_by_year.sort_values(['MVDID', 'Plan_year'])
@@ -542,9 +599,15 @@ deduct_type_by_year['plan_changed'] = (
     ~(deduct_type_by_year['deductible_types'] == deduct_type_by_year['prev_deductible_type'])).astype(int)
 deduct_type_by_year = deduct_type_by_year[['MVDID', 'Plan_year', 'plan_changed']]
 
-# Merge back
+# Merge check
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(deduct_type_by_year, on=['MVDID', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+
+# Fill missing values
+row_count_before = len(df_clean)
 df_clean['plan_changed'] = df_clean['plan_changed'].fillna(0).astype(int)
+assert row_count_before == len(df_clean), f"Row count changed from {row_count_before} to {len(df_clean)} after fillna"
 
 # Simplified inflation adjustment (use actual healthcare inflation data if available)
 inflation_factors = {
@@ -570,9 +633,15 @@ first_claim_month.rename(columns={'service_month': 'first_claim_month'}, inplace
 avg_first_month = first_claim_month.groupby('MVDID')['first_claim_month'].mean().reset_index()
 avg_first_month.rename(columns={'first_claim_month': 'avg_first_claim_month'}, inplace=True)
 
-# Merge both
+# Merge check for first_claim_month
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(first_claim_month, on=['MVDID', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+
+# Merge check for avg_first_month
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(avg_first_month, on='MVDID', how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Find the month when coinsurance first appeared each year (if available)
 coins_members = df_clean[df_clean['has_coinsurance'] == 1]
@@ -580,8 +649,10 @@ if len(coins_members) > 0:
     coins_months = coins_members.groupby(['MVDID', 'Plan_year'])['service_month'].min().reset_index()
     coins_months.rename(columns={'service_month': 'first_coins_month'}, inplace=True)
 
-    # Merge back
+    # Merge check
+    row_count_before = len(df_clean)
     df_clean = df_clean.merge(coins_months, on=['MVDID', 'Plan_year'], how='left')
+    assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
     # Calculate for members with coinsurance in multiple years
     multi_year_coins = coins_months.groupby('MVDID')['Plan_year'].count()
@@ -592,8 +663,10 @@ if len(coins_members) > 0:
             'first_coins_month'].std().reset_index()
         coins_month_std.rename(columns={'first_coins_month': 'coins_month_variation'}, inplace=True)
 
-        # Merge back
+        # Merge check
+        row_count_before = len(df_clean)
         df_clean = df_clean.merge(coins_month_std, on='MVDID', how='left')
+        assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
     else:
         df_clean['coins_month_variation'] = np.nan
 else:
@@ -603,7 +676,11 @@ else:
 # Check if family composition changed over years
 family_years = df_clean.groupby('family_id')['Plan_year'].nunique().reset_index()
 family_years.rename(columns={'Plan_year': 'family_years_in_data'}, inplace=True)
+
+# Merge check
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(family_years, on='family_id', how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 multi_year_families = family_years[family_years['family_years_in_data'] > 1]['family_id']
 
@@ -618,9 +695,15 @@ if len(multi_year_families) > 0:
         ~(family_size_by_year['family_size'] == family_size_by_year['prev_family_size'])).astype(int)
     family_size_by_year = family_size_by_year[['family_id', 'Plan_year', 'family_size_changed']]
 
-    # Merge back
+    # Merge check
+    row_count_before = len(df_clean)
     df_clean = df_clean.merge(family_size_by_year, on=['family_id', 'Plan_year'], how='left')
+    assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+
+    # Check row count after fillna
+    row_count_before = len(df_clean)
     df_clean['family_size_changed'] = df_clean['family_size_changed'].fillna(0).astype(int)
+    assert row_count_before == len(df_clean), f"Row count changed from {row_count_before} to {len(df_clean)} after fillna"
 else:
     df_clean['family_size_changed'] = 0
 
@@ -634,15 +717,21 @@ q1_deductibles.rename(columns={'DEDUCTIBLEAMOUNT': 'q1_deductible'}, inplace=Tru
 yearly_deductibles = df_clean.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
 yearly_deductibles.rename(columns={'DEDUCTIBLEAMOUNT': 'yearly_deductible'}, inplace=True)
 
-# Merge both
+# Merge both to create deductible_timing dataframe
+# Merge check for first merge in deductible_timing creation
+row_count_before = len(yearly_deductibles)
 deductible_timing = q1_deductibles.merge(yearly_deductibles, on=['MVDID', 'Plan_year'], how='right')
+# No assert here since this is a different merge pattern (right join to yearly_deductibles)
+
 deductible_timing['q1_deductible'] = deductible_timing['q1_deductible'].fillna(0)
 deductible_timing['q1_deductible_pct'] = deductible_timing['q1_deductible'] / deductible_timing[
     'yearly_deductible'].replace(0, np.nan)
 deductible_timing = deductible_timing[['MVDID', 'Plan_year', 'q1_deductible_pct']]
 
-# Merge back
+# Merge check for final merge back to df_clean
+row_count_before = len(df_clean)
 df_clean = df_clean.merge(deductible_timing, on=['MVDID', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 ################     PART 6. Company and Plan-Level Features       ##################
 # Analyze deductible patterns at the company level
@@ -672,24 +761,15 @@ company_cols = ['COMPANY_KEY', 'Plan_year', 'company_deductible_cv', 'company_me
                 'fam_total_deduct_amount_mean', 'family_size_mean']  # Changed family_total_deductible_mean to fam_total_deduct_amount_mean
 company_deduct_stats = company_deduct_stats[company_cols]
 
+row_count_before = len(df_clean)
 # Merge back to main dataset
 df_clean = df_clean.merge(company_deduct_stats, on=['COMPANY_KEY', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Calculate deductible amount relative to company average
 df_clean['deductible_to_company_avg'] = df_clean['DEDUCTIBLEAMOUNT'] / df_clean['DEDUCTIBLEAMOUNT_mean'].replace(0, np.nan)
 df_clean['member_deductible_to_company_avg'] = df_clean['member_total_deductible'] / df_clean['member_total_deductible_mean'].replace(0, np.nan)
+
 # Adjust this line to use fam_total_deduct_amount
 df_clean['family_deductible_to_company_avg'] = df_clean['fam_total_deduct_amount'] / df_clean['fam_total_deduct_amount_mean'].replace(0, np.nan)
 df_clean.info()
-
-
-# Save as CSV and create simple reload script
-df_clean.to_csv("clean_db.csv", index=False)
-
-# Create reload script
-with open("reload.py", "w") as f:
-    f.write("import pandas as pd\ndf_clean = pd.read_csv('clean_db.csv')")
-
-# Clear memory (run this, then restart your session)
-del df_clean
-
