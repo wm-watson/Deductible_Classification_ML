@@ -361,6 +361,9 @@ row_count_before = len(df_clean)
 df_clean = df_clean.merge(family_deduct_temp, on=['family_id', 'Plan_year'], how='left')
 assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
+#########Everything up to here, the joins are good###############
+
+
 # Step 2: Calculate family contribution metrics
 # Calculate member's contribution percentage to family deductible
 df_clean['member_deduct_contribution_pct'] = df_clean['member_fam_deduct_amount'] / df_clean[
