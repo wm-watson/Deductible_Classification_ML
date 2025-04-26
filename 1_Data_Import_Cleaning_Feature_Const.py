@@ -161,315 +161,181 @@ df_clean = df_clean.drop_duplicates(subset=key_columns)
 ###################Begin Constructing Variables##########################################
 
 
-######## PART 1 - Claimline, family size, companypspecific#######################
+######## PART 1 - Claim level, family size, company-specific ######################
 
-# Make claimline number counter
-df_clean['claim_line_number'] = df_clean.groupby('CLAIMNUMBER').cumcount() + 1
+# Define aggregation functions for each column
+agg_dict = {
+    'MVDID': 'first',
+    'SUBSCRIBERID': 'first',
+    'COMPANY_KEY': 'first',
+    'PATIENTGENDER': 'first',
+    'age_at_plan_year_start': 'first',
+    'Plan_year': 'first',
+    'family_size': 'first',
+    'DEDUCTIBLE_CATEGORY': 'first',
+    'deductible_types': 'first',
+    'unique_deductible_types': 'first',
+    'BILLEDAMOUNT': ['sum', 'mean', 'max', 'count'],
+    'ALLOWEDAMOUNT': ['sum', 'mean', 'max'],
+    'PAIDAMOUNT': ['sum', 'mean', 'max'],
+    'COINSURANCEAMOUNT': ['sum', 'mean', 'max'],
+    'COPAYAMOUNT': ['sum', 'mean', 'max'],
+    'DEDUCTIBLEAMOUNT': ['sum', 'mean', 'max'],
+    'SERVICEFROMDATE': ['min', 'max']
+}
 
-# Calculate total lines per claim and add to each row
-claim_counts = df_clean.groupby('CLAIMNUMBER').size().to_dict()
-df_clean['total_claim_lines'] = df_clean['CLAIMNUMBER'].map(claim_counts)
+# Perform aggregation
+claim_df = df_clean.groupby('CLAIMNUMBER').agg(agg_dict)
 
-df_clean.info()
+# Flatten columns
+claim_df.columns = [f"{col[0]}_{col[1]}" if isinstance(col, tuple) else col for col in claim_df.columns]
+claim_df = claim_df.reset_index()
 
-# Create family identifier
-df_clean['family_id'] = df_clean['SUBSCRIBERID']
+# Calculate claim-specific features
+claim_df['total_claim_lines'] = claim_df['BILLEDAMOUNT_count']
+claim_df['claim_duration_days'] = (claim_df['SERVICEFROMDATE_max'] - claim_df['SERVICEFROMDATE_min']).dt.days
+claim_df['claim_duration_days'] = claim_df['claim_duration_days'].fillna(0).clip(lower=0)
 
-# Count unique individuals in each family
-family_member_counts = df_clean.groupby('family_id')['MVDID'].nunique().to_dict()
-df_clean['unique_family_members'] = df_clean['family_id'].map(family_member_counts)
+# Create family identifier and features
+claim_df['family_id'] = claim_df['SUBSCRIBERID_first']
 
-# Flag whether family_size matches actual unique members seen in claims
-df_clean['family_size_matches_members'] = (df_clean['family_size'] == df_clean['unique_family_members']).astype(int)
+# Get family member counts (efficiently using claim-level data)
+family_member_counts = df_clean.groupby('SUBSCRIBERID')['MVDID'].nunique()
+claim_df['unique_family_members'] = claim_df['family_id'].map(family_member_counts)
+claim_df['family_size_matches_members'] = (claim_df['family_size_first'] == claim_df['unique_family_members']).astype(int)
 
-# Company-specific
-company_deductible_types = df_clean.groupby(['COMPANY_KEY', 'Plan_year'])['deductible_types'].nunique().reset_index()
-company_deductible_types.rename(columns={'deductible_types': 'company_deductible_types_count'}, inplace=True)
+# Company-specific features
+company_deductible_types = claim_df.groupby(['COMPANY_KEY_first', 'Plan_year_first'])['deductible_types_first'].nunique().reset_index()
+company_deductible_types.columns = ['COMPANY_KEY_first', 'Plan_year_first', 'company_deductible_types_count']
 
-# Add merge check
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(company_deductible_types, on=['COMPANY_KEY', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+# Verify merge
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(company_deductible_types, on=['COMPANY_KEY_first', 'Plan_year_first'], how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count: {row_count_before} to {len(claim_df)}"
 
-# Flag companies with multiple deductible types in same year
-df_clean['company_has_multiple_deductible_types'] = (df_clean['company_deductible_types_count'] > 1).astype(int)
+# Flag companies with multiple deductible types
+claim_df['company_has_multiple_deductible_types'] = (claim_df['company_deductible_types_count'] > 1).astype(int)
 
-######## Part 2. Financial Ratios & Patterns      ############################
+######## Part 2. Financial Ratios & Patterns at Claim Level ############################
 
-# Financial ratios
-df_clean['deductible_to_allowed_ratio'] = df_clean['DEDUCTIBLEAMOUNT'] / df_clean['ALLOWEDAMOUNT'].replace(0, np.nan)
-df_clean['patient_responsibility'] = df_clean['COINSURANCEAMOUNT'] + df_clean['COPAYAMOUNT'] + df_clean['DEDUCTIBLEAMOUNT']
-df_clean['deductible_to_responsibility_ratio'] = df_clean['DEDUCTIBLEAMOUNT'] / df_clean['patient_responsibility'].replace(0, np.nan)
-df_clean['deductible_to_billed_ratio'] = df_clean['DEDUCTIBLEAMOUNT'] / df_clean['BILLEDAMOUNT'].replace(0, np.nan)
-df_clean['patient_share'] = df_clean['patient_responsibility'] / df_clean['ALLOWEDAMOUNT'].replace(0, np.nan)
-df_clean['insurance_covered_ratio'] = df_clean['PAIDAMOUNT'] / df_clean['ALLOWEDAMOUNT'].replace(0, np.nan)
+# Calculate financial ratios at claim level
+claim_df['deductible_to_allowed_ratio'] = claim_df['DEDUCTIBLEAMOUNT_sum'] / claim_df['ALLOWEDAMOUNT_sum'].replace(0, np.nan)
+claim_df['patient_responsibility'] = claim_df['COINSURANCEAMOUNT_sum'] + claim_df['COPAYAMOUNT_sum'] + claim_df['DEDUCTIBLEAMOUNT_sum']
+claim_df['deductible_to_responsibility_ratio'] = claim_df['DEDUCTIBLEAMOUNT_sum'] / claim_df['patient_responsibility'].replace(0, np.nan)
+claim_df['deductible_to_billed_ratio'] = claim_df['DEDUCTIBLEAMOUNT_sum'] / claim_df['BILLEDAMOUNT_sum'].replace(0, np.nan)
+claim_df['patient_share'] = claim_df['patient_responsibility'] / claim_df['ALLOWEDAMOUNT_sum'].replace(0, np.nan)
+claim_df['insurance_covered_ratio'] = claim_df['PAIDAMOUNT_sum'] / claim_df['ALLOWEDAMOUNT_sum'].replace(0, np.nan)
 
-# Flag claims where coinsurance is present - this indicates when deductible has been met
-df_clean['has_coinsurance'] = (df_clean['COINSURANCEAMOUNT'] > 0).astype(int)
-df_clean['has_copay'] = (df_clean['COPAYAMOUNT'] > 0).astype(int)
-df_clean['has_deductible'] = (df_clean['DEDUCTIBLEAMOUNT'] > 0).astype(int)
+# Flag claims with specific cost sharing components
+claim_df['has_coinsurance'] = (claim_df['COINSURANCEAMOUNT_sum'] > 0).astype(int)
+claim_df['has_copay'] = (claim_df['COPAYAMOUNT_sum'] > 0).astype(int)
+claim_df['has_deductible'] = (claim_df['DEDUCTIBLEAMOUNT_sum'] > 0).astype(int)
 
-# Calculate total deductible paid by each member for each plan year
-member_deductibles = df_clean.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
-member_deductibles.rename(columns={'DEDUCTIBLEAMOUNT': 'member_total_deductible'}, inplace=True)
+# Fill NaN values with 0 for better downstream handling
+ratio_cols = [
+    'deductible_to_allowed_ratio', 'deductible_to_responsibility_ratio',
+    'deductible_to_billed_ratio', 'patient_share', 'insurance_covered_ratio'
+]
+claim_df[ratio_cols] = claim_df[ratio_cols].fillna(0)
 
-# Check row count before and after merge
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(member_deductibles, on=['MVDID', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+######## Part 3. Time-based Feature Construction at Claim Level #########################
 
-# Calculate average financials per claim
-claim_financials = df_clean.groupby('CLAIMNUMBER').agg({
-    'BILLEDAMOUNT': 'sum',
-    'ALLOWEDAMOUNT': 'sum',
-    'PAIDAMOUNT': 'sum',
-    'DEDUCTIBLEAMOUNT': 'sum',
-    'COINSURANCEAMOUNT': 'sum',
-    'COPAYAMOUNT': 'sum'
-}).reset_index()
-
-claim_financials['claim_deductible_to_allowed_ratio'] = claim_financials['DEDUCTIBLEAMOUNT'] / claim_financials['ALLOWEDAMOUNT'].replace(0, np.nan)
-claim_financials['claim_patient_responsibility'] = claim_financials['DEDUCTIBLEAMOUNT'] + claim_financials['COINSURANCEAMOUNT'] + claim_financials['COPAYAMOUNT']
-claim_financials['claim_patient_share'] = claim_financials['claim_patient_responsibility'] / claim_financials['ALLOWEDAMOUNT'].replace(0, np.nan)
-
-# Keep cal columns
-claim_financials = claim_financials[['CLAIMNUMBER', 'claim_deductible_to_allowed_ratio', 'claim_patient_responsibility', 'claim_patient_share']]
-
-# Add merge check for claim financials
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(claim_financials, on='CLAIMNUMBER', how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-
-######## Part 3. Time-based Feature Construction#########################
-
-# Extract time-based features
-df_clean['service_year'] = df_clean['SERVICEFROMDATE'].dt.year
-df_clean['service_month'] = df_clean['SERVICEFROMDATE'].dt.month
-df_clean['service_quarter'] = df_clean['SERVICEFROMDATE'].dt.quarter
-df_clean['service_day_of_week'] = df_clean['SERVICEFROMDATE'].dt.dayofweek
-df_clean['service_day_of_year'] = df_clean['SERVICEFROMDATE'].dt.dayofyear
-df_clean['is_beginning_of_year'] = (df_clean['service_month'] <= 3).astype(int)
-df_clean['is_end_of_year'] = (df_clean['service_month'] >= 10).astype(int)
+# Extract time-based features from the first service date of each claim
+claim_df['service_year'] = claim_df['SERVICEFROMDATE_min'].dt.year
+claim_df['service_month'] = claim_df['SERVICEFROMDATE_min'].dt.month
+claim_df['service_quarter'] = claim_df['SERVICEFROMDATE_min'].dt.quarter
+claim_df['service_day_of_week'] = claim_df['SERVICEFROMDATE_min'].dt.dayofweek
+claim_df['service_day_of_year'] = claim_df['SERVICEFROMDATE_min'].dt.dayofyear
+claim_df['is_beginning_of_year'] = (claim_df['service_month'] <= 3).astype(int)
+claim_df['is_end_of_year'] = (claim_df['service_month'] >= 10).astype(int)
 
 # Sort claims chronologically
-df_sorted = df_clean.sort_values(['MVDID', 'Plan_year', 'SERVICEFROMDATE'])
+claim_df_sorted = claim_df.sort_values(['MVDID_first', 'Plan_year_first', 'SERVICEFROMDATE_min'])
 
-# Add sequence numbers
-df_sorted['patient_claim_sequence'] = df_sorted.groupby('MVDID').cumcount() + 1
-df_sorted['patient_plan_year_claim_sequence'] = df_sorted.groupby(['MVDID', 'Plan_year']).cumcount() + 1
-df_clean = df_sorted.copy()
+# Add claim sequence numbers at the claim level
+claim_df_sorted['patient_claim_sequence'] = claim_df_sorted.groupby('MVDID_first').cumcount() + 1
+claim_df_sorted['patient_plan_year_claim_sequence'] = claim_df_sorted.groupby(['MVDID_first', 'Plan_year_first']).cumcount() + 1
 
-# Flag the first claim with coinsurance for each member in each plan year
-df_clean['cumulative_coinsurance'] = df_clean.groupby(['MVDID', 'Plan_year'])['has_coinsurance'].cumsum()
-df_clean['first_coinsurance'] = (df_clean['cumulative_coinsurance'] == 1) & (df_clean['has_coinsurance'] == 1)
+# Update the main dataframe
+claim_df = claim_df_sorted.copy()
 
-# Flag if member ever has coinsurance in the plan year
-member_has_coins = df_clean.groupby(['MVDID', 'Plan_year'])['has_coinsurance'].max().reset_index()
-member_has_coins.rename(columns={'has_coinsurance': 'ever_has_coinsurance'}, inplace=True)
+# Calculate coinsurance patterns at the claim level
+claim_df['cumulative_coinsurance'] = claim_df.groupby(['MVDID_first', 'Plan_year_first'])['has_coinsurance'].cumsum()
+claim_df['first_coinsurance'] = (claim_df['cumulative_coinsurance'] == 1) & (claim_df['has_coinsurance'] == 1)
 
-# Add merge check here
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(member_has_coins, on=['MVDID', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+# Flag if member ever has coinsurance in the plan year (calculated from claim-level data)
+member_has_coins = claim_df.groupby(['MVDID_first', 'Plan_year_first'])['has_coinsurance'].max().reset_index()
+member_has_coins.columns = ['MVDID_first', 'Plan_year_first', 'ever_has_coinsurance']
 
-# For members who have coinsurance, calculate deductible before first coinsurance
-before_coinsurance = df_clean.loc[
-    (df_clean['ever_has_coinsurance'] == 1) &  # Only consider members who eventually have coinsurance
-    (df_clean.groupby(['MVDID', 'Plan_year'])['cumulative_coinsurance'].transform('cumsum') == 0)
-    # Before first coinsurance
-    ]
+# Add merge check
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(member_has_coins, on=['MVDID_first', 'Plan_year_first'], how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-if len(before_coinsurance) > 0:
-    deduct_before_coins = before_coinsurance.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
-    deduct_before_coins.rename(columns={'DEDUCTIBLEAMOUNT': 'deductible_before_coinsurance'}, inplace=True)
+# For members who have coinsurance, identify claims before the first coinsurance claim
+# Add a marker to identify claims that occur before the first coinsurance
+claim_df['before_first_coinsurance'] = (
+    (claim_df['ever_has_coinsurance'] == 1) &
+    (claim_df['cumulative_coinsurance'] == 0)
+).astype(int)
 
-    # Add merge check here
-    row_count_before = len(df_clean)
-    # Merge back
-    df_clean = df_clean.merge(deduct_before_coins, on=['MVDID', 'Plan_year'], how='left')
-    assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-else:
-    df_clean['deductible_before_coinsurance'] = np.nan
-
-# For members without coinsurance, set their deductible_before_coinsurance to their total deductible
-no_coins_members = df_clean[df_clean['ever_has_coinsurance'] == 0]
-if len(no_coins_members) > 0:
-    no_coins_deduct = no_coins_members.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
-    no_coins_deduct.rename(columns={'DEDUCTIBLEAMOUNT': 'no_coins_total_deductible'}, inplace=True)
-
-    # Add merge check here
-    row_count_before = len(df_clean)
-    # Merge back
-    df_clean = df_clean.merge(no_coins_deduct, on=['MVDID', 'Plan_year'], how='left')
-    assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-
-    # Fill in deductible_before_coinsurance with total deductible for no-coinsurance members
-    df_clean.loc[df_clean['ever_has_coinsurance'] == 0, 'deductible_before_coinsurance'] = df_clean[
-        'no_coins_total_deductible']
-
-    # Drop the temporary column
-    df_clean = df_clean.drop(columns=['no_coins_total_deductible'])
+# Create a feature for deductible amount on claims before first coinsurance
+claim_df['deductible_on_precoins_claim'] = np.where(
+    claim_df['before_first_coinsurance'] == 1,
+    claim_df['DEDUCTIBLEAMOUNT_sum'],
+    0
+)
 
 # Create flag for members who never have coinsurance
-df_clean['never_has_coinsurance'] = (df_clean['ever_has_coinsurance'] == 0).astype(int)
+claim_df['never_has_coinsurance'] = (claim_df['ever_has_coinsurance'] == 0).astype(int)
 
-# For members with coinsurance, calculate the ratio of deductible before coinsurance to total deductible
-# This calculation should be done at member-year level to avoid duplicating calculations
-member_deduct_ratio = df_clean.drop_duplicates(subset=['MVDID', 'Plan_year']).copy()
-member_deduct_ratio['deductible_before_coins_ratio'] = np.nan  # Initialize with NaN
+######## Part 4: Family Contribution Analysis at Claim Level #########################
 
-# Only calculate for members with coinsurance and positive total deductible
-valid_mask = (member_deduct_ratio['ever_has_coinsurance'] == 1) & (member_deduct_ratio['member_total_deductible'] > 0)
+# Create family identifier using subscriber ID
+claim_df['family_id'] = claim_df['SUBSCRIBERID_first']
 
-# Ensure deductible_before_coinsurance is not NaN for the calculation
-calc_mask = valid_mask & member_deduct_ratio['deductible_before_coinsurance'].notna()
+# Calculate total deductible paid by each claim
+claim_df['claim_deductible_amount'] = claim_df['DEDUCTIBLEAMOUNT_sum']
 
-if calc_mask.any():
-    member_deduct_ratio.loc[calc_mask, 'deductible_before_coins_ratio'] = (
-        member_deduct_ratio.loc[calc_mask, 'deductible_before_coinsurance'] /
-        member_deduct_ratio.loc[calc_mask, 'member_total_deductible']
-    )
-
-# Keep only the columns we need
-member_deduct_ratio = member_deduct_ratio[['MVDID', 'Plan_year', 'deductible_before_coins_ratio']]
-
-# Merge back to the main dataframe with check
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(member_deduct_ratio, on=['MVDID', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-df_clean.info()
-
-######## Part 4: Individual-to-Family Contribution Analysis #########################
-
-# Step 1: Calculate clean versions of family and member deductibles
 # Calculate total deductible paid by each member within family for each plan year
-member_fam_deduct = df_clean.groupby(['family_id', 'MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
-member_fam_deduct.rename(columns={'DEDUCTIBLEAMOUNT': 'member_fam_deduct_amount'}, inplace=True)
+# This uses claim-level data to calculate member and family totals
+member_fam_deduct = claim_df.groupby(['family_id', 'MVDID_first', 'Plan_year_first'])['claim_deductible_amount'].sum().reset_index()
+member_fam_deduct.columns = ['family_id', 'MVDID_first', 'Plan_year_first', 'member_fam_deduct_amount']
 
-row_count_before = len(df_clean)
-# Merge back to get individual contribution
-df_clean = df_clean.merge(member_fam_deduct, on=['family_id', 'MVDID', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+# Calculate family total deductible
+family_deduct = member_fam_deduct.groupby(['family_id', 'Plan_year_first'])['member_fam_deduct_amount'].sum().reset_index()
+family_deduct.columns = ['family_id', 'Plan_year_first', 'fam_total_deduct_amount']
 
-# Calculate family total deductible (ensuring we avoid duplicates)
-family_deduct_temp = member_fam_deduct.groupby(['family_id', 'Plan_year'])[
-    'member_fam_deduct_amount'].sum().reset_index()
-family_deduct_temp.rename(columns={'member_fam_deduct_amount': 'fam_total_deduct_amount'}, inplace=True)
+# Merge family and member deductible information back to claims
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(member_fam_deduct, on=['family_id', 'MVDID_first', 'Plan_year_first'], how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-row_count_before = len(df_clean)
-# Merge family totals
-df_clean = df_clean.merge(family_deduct_temp, on=['family_id', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(family_deduct, on=['family_id', 'Plan_year_first'], how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-# Step 2: Calculate family contribution metrics
+# Calculate claim contribution to family deductible
+claim_df['claim_to_member_deduct_ratio'] = claim_df['claim_deductible_amount'] / claim_df['member_fam_deduct_amount'].replace(0, np.nan)
+claim_df['claim_to_family_deduct_ratio'] = claim_df['claim_deductible_amount'] / claim_df['fam_total_deduct_amount'].replace(0, np.nan)
+
 # Calculate member's contribution percentage to family deductible
-df_clean['member_deduct_contribution_pct'] = df_clean['member_fam_deduct_amount'] / df_clean[
-    'fam_total_deduct_amount'].replace(0, np.nan)
+claim_df['member_deduct_contribution_pct'] = claim_df['member_fam_deduct_amount'] / claim_df['fam_total_deduct_amount'].replace(0, np.nan)
 
 # Calculate the max individual deductible within family
-family_max = member_fam_deduct.groupby(['family_id', 'Plan_year'])['member_fam_deduct_amount'].max().reset_index()
-family_max.rename(columns={'member_fam_deduct_amount': 'family_max_member_deduct'}, inplace=True)
+family_max = member_fam_deduct.groupby(['family_id', 'Plan_year_first'])['member_fam_deduct_amount'].max().reset_index()
+family_max.columns = ['family_id', 'Plan_year_first', 'family_max_member_deduct']
 
-# Create the groups
-family_groups = member_fam_deduct.groupby(['family_id', 'Plan_year'])
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(family_max, on=['family_id', 'Plan_year_first'], how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-# Define the family deductible stats calculation function with NumPy functions
-def calc_family_deduct_stats(x):
-    if len(x) <= 1:
-        return {
-            'fam_deduct_variation': 0,
-            'fam_deduct_max_to_mean': 1,
-            'fam_deduct_skew': 0,
-            'fam_deduct_gini': 0
-        }
+# Calculate family structure metrics relevant to claims
+claim_df['max_to_family_deduct_ratio'] = claim_df['family_max_member_deduct'] / claim_df['fam_total_deduct_amount'].replace(0, np.nan)
+claim_df['deduct_per_family_member'] = claim_df['fam_total_deduct_amount'] / claim_df['family_size_first']
+claim_df['member_to_avg_deduct_ratio'] = claim_df['member_fam_deduct_amount'] / claim_df['deduct_per_family_member'].replace(0, np.nan)
 
-    mean = np.mean(x)
-    if mean == 0:
-        return {
-            'fam_deduct_variation': 0,
-            'fam_deduct_max_to_mean': 1 if len(x) > 0 else 0,
-            'fam_deduct_skew': 0,
-            'fam_deduct_gini': 0
-        }
-
-    # Coefficient of variation
-    cv = np.std(x) / mean if mean > 0 else 0
-
-    # Max to mean ratio
-    max_to_mean = np.max(x) / mean if mean > 0 else 0
-
-    # Simple skew calculation
-    median = np.median(x)
-    skew = (mean - median) / mean if mean > 0 else 0
-
-    # Simple Gini coefficient (measure of inequality)
-    sorted_x = np.sort(x)
-    n = len(x)
-    index = np.arange(1, n + 1)
-    gini = (np.sum((2 * index - n - 1) * sorted_x)) / (n * np.sum(sorted_x)) if np.sum(sorted_x) > 0 else 0
-
-    return {
-        'fam_deduct_variation': cv,
-        'fam_deduct_max_to_mean': max_to_mean,
-        'fam_deduct_skew': skew,
-        'fam_deduct_gini': gini
-    }
-
-
-# Now run the alternative approach
-# More efficient collection method
-results = []
-
-# Process each group and store results
-for (family_id, plan_year), group in family_groups:
-    x = group['member_fam_deduct_amount'].values
-
-    # Get stats using your function
-    stats = calc_family_deduct_stats(x)
-
-    # Add to results with explicit keys
-    new_row = {'family_id': family_id, 'Plan_year': plan_year}
-    new_row.update(stats)
-    results.append(new_row)
-
-# Convert results to DataFrame after loop completes
-family_stats_alt = pd.DataFrame(results)
-
-# Verify no duplicates
-assert family_stats_alt.duplicated(subset=['family_id', 'Plan_year']).sum() == 0
-
-# Now perform the merge
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(family_stats_alt, on=['family_id', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-
-# First create the family_max_member_deduct column
-family_max_deduct = member_fam_deduct.groupby(['family_id', 'Plan_year'])['member_fam_deduct_amount'].max().reset_index()
-family_max_deduct.rename(columns={'member_fam_deduct_amount': 'family_max_member_deduct'}, inplace=True)
-
-# Merge this into df_clean
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(family_max_deduct, on=['family_id', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-
-# Step 3: Calculate additional family structure metrics
-# Ratio of max individual deductible to family total
-df_clean['max_to_family_deduct_ratio'] = df_clean['family_max_member_deduct'] / df_clean[
-    'fam_total_deduct_amount'].replace(0, np.nan)
-
-# Ratio of total family deductible to family size
-df_clean['deduct_per_family_member'] = df_clean['fam_total_deduct_amount'] / df_clean['family_size']
-
-# Ratio of member's deductible to average deductible per family member
-df_clean['member_to_avg_deduct_ratio'] = df_clean['member_fam_deduct_amount'] / df_clean[
-    'deduct_per_family_member'].replace(0, np.nan)
-
-
-# Step 4: Features that might indicate aggregate vs embedded structure
-# In aggregate deductibles, we expect more concentrated spending (one person pays most of the deductible)
-# In embedded deductibles, we expect more distributed spending (each person has their own deductible)
-
-# Calculate concentration ratios (similar to Herfindahl index)
+# Calculate family concentration measures
 def calc_concentration(group):
     deduct_amounts = group['member_fam_deduct_amount'].values
     total_deduct = sum(deduct_amounts)
@@ -494,279 +360,185 @@ def calc_concentration(group):
         'top_member_deduct_share': top_share
     })
 
-
 # Apply to each family-year
-family_concentration = member_fam_deduct.groupby(['family_id', 'Plan_year']).apply(calc_concentration).reset_index()
+family_concentration = member_fam_deduct.groupby(['family_id', 'Plan_year_first']).apply(calc_concentration).reset_index()
 
-# Add merge check here
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(family_concentration, on=['family_id', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+# Merge concentration metrics
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(family_concentration, on=['family_id', 'Plan_year_first'], how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-# Step 5: Calculate features related to deductible payment patterns
-# For aggregate deductibles, we might see family members waiting until one member meets most of the deductible
-# For embedded deductibles, payment patterns should be more independent
+# Calculate claim-specific timing features
+# Identify claims with deductible
+deduct_claims = claim_df[claim_df['claim_deductible_amount'] > 0].copy()
 
-# First, get each member's first deductible payment date in the plan year
-member_first_deduct = df_clean[df_clean['DEDUCTIBLEAMOUNT'] > 0].groupby(['family_id', 'MVDID', 'Plan_year'])[
-    'SERVICEFROMDATE'].min().reset_index()
-member_first_deduct.rename(columns={'SERVICEFROMDATE': 'first_deduct_date'}, inplace=True)
+if not deduct_claims.empty:
+    # Find first deductible claim for each member and family
+    member_first_deduct = deduct_claims.groupby(['family_id', 'MVDID_first', 'Plan_year_first'])['SERVICEFROMDATE_min'].min().reset_index()
+    member_first_deduct.columns = ['family_id', 'MVDID_first', 'Plan_year_first', 'first_deduct_date']
 
-# Get family's first deductible date
-family_first_deduct = member_first_deduct.groupby(['family_id', 'Plan_year'])['first_deduct_date'].min().reset_index()
-family_first_deduct.rename(columns={'first_deduct_date': 'family_first_deduct_date'}, inplace=True)
+    family_first_deduct = member_first_deduct.groupby(['family_id', 'Plan_year_first'])['first_deduct_date'].min().reset_index()
+    family_first_deduct.columns = ['family_id', 'Plan_year_first', 'family_first_deduct_date']
 
-row_count_before = len(df_clean)
-# Merge both back
-df_clean = df_clean.merge(member_first_deduct, on=['family_id', 'MVDID', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+    # Merge both to claims
+    row_count_before = len(claim_df)
+    claim_df = claim_df.merge(member_first_deduct, on=['family_id', 'MVDID_first', 'Plan_year_first'], how='left')
+    assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(family_first_deduct, on=['family_id', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+    row_count_before = len(claim_df)
+    claim_df = claim_df.merge(family_first_deduct, on=['family_id', 'Plan_year_first'], how='left')
+    assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-# Calculate days between family's first deductible and member's first deductible
-df_clean['days_after_family_first_deduct'] = (
-            df_clean['first_deduct_date'] - df_clean['family_first_deduct_date']).dt.days
+    # Calculate claim timing relative to family's first deductible
+    claim_df['claim_days_since_family_first_deduct'] = (claim_df['SERVICEFROMDATE_min'] - claim_df['family_first_deduct_date']).dt.days
 
+    # Flag if this claim is the member's first deductible claim
+    claim_df['is_member_first_deduct_claim'] = (claim_df['SERVICEFROMDATE_min'] == claim_df['first_deduct_date']).astype(int)
 
-# Calculate variance in first deductible dates within family
-def calc_date_variance(dates):
-    if len(dates) <= 1:
-        return 0
-    # Convert to days since minimum date
-    min_date = min(dates)
-    days_diff = [(date - min_date).days for date in dates]
-    return np.var(days_diff)
+    # Flag if this claim is the family's first deductible claim
+    claim_df['is_family_first_deduct_claim'] = (claim_df['SERVICEFROMDATE_min'] == claim_df['family_first_deduct_date']).astype(int)
+else:
+    # If no claims have deductibles, create placeholder columns
+    claim_df['first_deduct_date'] = pd.NaT
+    claim_df['family_first_deduct_date'] = pd.NaT
+    claim_df['claim_days_since_family_first_deduct'] = np.nan
+    claim_df['is_member_first_deduct_claim'] = 0
+    claim_df['is_family_first_deduct_claim'] = 0
 
+# Count members with deductible in each family
+members_with_deduct = member_fam_deduct[member_fam_deduct['member_fam_deduct_amount'] > 0].groupby(['family_id', 'Plan_year_first']).size().reset_index()
+members_with_deduct.columns = ['family_id', 'Plan_year_first', 'members_with_deduct']
 
-family_date_var = member_first_deduct.groupby(['family_id', 'Plan_year'])['first_deduct_date'].apply(
-    lambda x: calc_date_variance(x)).reset_index()
-family_date_var.rename(columns={'first_deduct_date': 'family_deduct_date_variance'}, inplace=True)
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(members_with_deduct, on=['family_id', 'Plan_year_first'], how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-# Add merge check here
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(family_date_var, on=['family_id', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+# Calculate percentage of family with deductible
+claim_df['pct_family_with_deduct'] = claim_df['members_with_deduct'] / claim_df['family_size_first']
 
-# Step 6: Create features based on family member utilization patterns
-# Calculate what percentage of family members have deductible payments
-family_member_with_deduct = member_fam_deduct[member_fam_deduct['member_fam_deduct_amount'] > 0].groupby(
-    ['family_id', 'Plan_year']).size().reset_index()
-family_member_with_deduct.rename(columns={0: 'members_with_deduct'}, inplace=True)
-
-# Add merge check here
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(family_member_with_deduct, on=['family_id', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-
-df_clean['pct_family_with_deduct'] = df_clean['members_with_deduct'] / df_clean['family_size']
-
-# Fill NAs with appropriate values for all created columns
-deduct_cols = [col for col in df_clean.columns if
-               'deduct' in col.lower() and df_clean[col].dtype in [np.float64, np.float32]]
+# Fill NAs with appropriate values
+deduct_cols = [col for col in claim_df.columns if 'deduct' in col.lower() and claim_df[col].dtype in [np.float64, np.float32]]
 for col in deduct_cols:
-    if col.startswith('pct_') or col.endswith('_ratio') or col.endswith('_share'):
-        df_clean[col] = df_clean[col].fillna(0)
+    if col.endswith('_ratio') or col.endswith('_pct') or col.endswith('_share'):
+        claim_df[col] = claim_df[col].fillna(0)
 
-######## Part 5. MULTI-Year Analysis Features######
+######## Part 5. Multi-Year Analysis Features at Claim Level ######
 
-# Calculate consistency of deductible structure for each member across years
-yearly_deductibles = df_clean.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
-
-# Calculate variation across years for the same member
-member_years = yearly_deductibles.groupby('MVDID')['Plan_year'].count().reset_index()
-member_years.rename(columns={'Plan_year': 'member_years_in_data'}, inplace=True)
+# For plan changes and continuity features, we need to track member history
+# First identify which years each claim member appears in
+member_years = claim_df.groupby('MVDID_first')['Plan_year_first'].nunique().reset_index()
+member_years.columns = ['MVDID_first', 'member_years_in_data']
 
 # Merge check
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(member_years, on='MVDID', how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-
-# Only calculate year-over-year metrics for members with multiple years
-multi_year_members = yearly_deductibles[yearly_deductibles['MVDID'].isin(
-    member_years[member_years['member_years_in_data'] > 1]['MVDID'])]
-
-if len(multi_year_members) > 0:
-    member_year_variation = multi_year_members.groupby('MVDID').agg(
-        deduct_std=('DEDUCTIBLEAMOUNT', 'std'),
-        deduct_mean=('DEDUCTIBLEAMOUNT', 'mean')
-    ).reset_index()
-
-    member_year_variation['year_over_year_variation'] = member_year_variation['deduct_std'] / member_year_variation[
-        'deduct_mean'].replace(0, np.nan)
-    member_year_variation = member_year_variation[['MVDID', 'year_over_year_variation']]
-
-    # Merge check
-    row_count_before = len(df_clean)
-    df_clean = df_clean.merge(member_year_variation, on='MVDID', how='left')
-    assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-else:
-    df_clean['year_over_year_variation'] = np.nan
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(member_years, on='MVDID_first', how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
 # Track if deductible_types changed for a member across years
-deduct_type_by_year = df_clean.groupby(['MVDID', 'Plan_year'])['deductible_types'].first().reset_index()
+# Get one record per member-year with their deductible type
+deduct_type_by_year = claim_df.groupby(['MVDID_first', 'Plan_year_first'])['deductible_types_first'].first().reset_index()
+deduct_type_by_year.columns = ['MVDID_first', 'Plan_year_first', 'deductible_type_by_year']
 
 # Calculate number of unique deductible types a member had over all years
-member_deduct_types = deduct_type_by_year.groupby('MVDID')['deductible_types'].nunique().reset_index()
-member_deduct_types.rename(columns={'deductible_types': 'deductible_type_changes'}, inplace=True)
+member_deduct_types = deduct_type_by_year.groupby('MVDID_first')['deductible_type_by_year'].nunique().reset_index()
+member_deduct_types.columns = ['MVDID_first', 'deductible_type_changes']
 
 # Merge check
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(member_deduct_types, on='MVDID', how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(member_deduct_types, on='MVDID_first', how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
 # Flag if this year's deductible type is different from previous year for this member
-deduct_type_by_year = deduct_type_by_year.sort_values(['MVDID', 'Plan_year'])
-deduct_type_by_year['prev_deductible_type'] = deduct_type_by_year.groupby('MVDID')['deductible_types'].shift(1)
-deduct_type_by_year['plan_changed'] = (
-    ~(deduct_type_by_year['deductible_types'] == deduct_type_by_year['prev_deductible_type'])).astype(int)
-deduct_type_by_year = deduct_type_by_year[['MVDID', 'Plan_year', 'plan_changed']]
+deduct_type_by_year = deduct_type_by_year.sort_values(['MVDID_first', 'Plan_year_first'])
+deduct_type_by_year['prev_deductible_type'] = deduct_type_by_year.groupby('MVDID_first')['deductible_type_by_year'].shift(1)
+deduct_type_by_year['plan_changed'] = (~(deduct_type_by_year['deductible_type_by_year'] == deduct_type_by_year['prev_deductible_type'])).astype(int)
+deduct_type_by_year = deduct_type_by_year[['MVDID_first', 'Plan_year_first', 'plan_changed']]
 
 # Merge check
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(deduct_type_by_year, on=['MVDID', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(deduct_type_by_year, on=['MVDID_first', 'Plan_year_first'], how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
 # Fill missing values
-row_count_before = len(df_clean)
-df_clean['plan_changed'] = df_clean['plan_changed'].fillna(0).astype(int)
-assert row_count_before == len(df_clean), f"Row count changed from {row_count_before} to {len(df_clean)} after fillna"
+claim_df['plan_changed'] = claim_df['plan_changed'].fillna(0).astype(int)
 
 # Simplified inflation adjustment (use actual healthcare inflation data if available)
 inflation_factors = {
-    2016: 1.00,
-    2017: 1.03,
-    2018: 1.06,
-    2019: 1.10,
-    2020: 1.13,
-    2021: 1.18,
-    2022: 1.25,
-    2023: 1.31
+    2016: 1.00, 2017: 1.03, 2018: 1.06, 2019: 1.10, 2020: 1.13,
+    2021: 1.18, 2022: 1.25, 2023: 1.31, 2024: 1.36, 2025: 1.41
 }
 
-# Create adjusted deductible amount
-df_clean['inflation_factor'] = df_clean['Plan_year'].map(inflation_factors)
-df_clean['adjusted_deductible'] = df_clean['DEDUCTIBLEAMOUNT'] / df_clean['inflation_factor']
+# Create adjusted deductible amount for claim
+claim_df['inflation_factor'] = claim_df['Plan_year_first'].map(inflation_factors)
+claim_df['adjusted_deductible'] = claim_df['DEDUCTIBLEAMOUNT_sum'] / claim_df['inflation_factor']
 
-# Find first month with claims for each member in each year
-first_claim_month = df_clean.groupby(['MVDID', 'Plan_year'])['service_month'].min().reset_index()
-first_claim_month.rename(columns={'service_month': 'first_claim_month'}, inplace=True)
+# Calculate claim timing relative to the year
+claim_df['is_first_quarter'] = (claim_df['service_quarter'] == 1).astype(int)
+claim_df['is_last_quarter'] = (claim_df['service_quarter'] == 4).astype(int)
 
-# Calculate average first claim month across years
-avg_first_month = first_claim_month.groupby('MVDID')['first_claim_month'].mean().reset_index()
-avg_first_month.rename(columns={'first_claim_month': 'avg_first_claim_month'}, inplace=True)
-
-# Merge check for first_claim_month
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(first_claim_month, on=['MVDID', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-
-# Merge check for avg_first_month
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(avg_first_month, on='MVDID', how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-
-# Find the month when coinsurance first appeared each year (if available)
-coins_members = df_clean[df_clean['has_coinsurance'] == 1]
-if len(coins_members) > 0:
-    coins_months = coins_members.groupby(['MVDID', 'Plan_year'])['service_month'].min().reset_index()
-    coins_months.rename(columns={'service_month': 'first_coins_month'}, inplace=True)
-
-    # Merge check
-    row_count_before = len(df_clean)
-    df_clean = df_clean.merge(coins_months, on=['MVDID', 'Plan_year'], how='left')
-    assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-
-    # Calculate for members with coinsurance in multiple years
-    multi_year_coins = coins_months.groupby('MVDID')['Plan_year'].count()
-    multi_year_coins = multi_year_coins[multi_year_coins > 1].index
-
-    if len(multi_year_coins) > 0:
-        coins_month_std = coins_months[coins_months['MVDID'].isin(multi_year_coins)].groupby('MVDID')[
-            'first_coins_month'].std().reset_index()
-        coins_month_std.rename(columns={'first_coins_month': 'coins_month_variation'}, inplace=True)
-
-        # Merge check
-        row_count_before = len(df_clean)
-        df_clean = df_clean.merge(coins_month_std, on='MVDID', how='left')
-        assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
-    else:
-        df_clean['coins_month_variation'] = np.nan
-else:
-    df_clean['first_coins_month'] = np.nan
-    df_clean['coins_month_variation'] = np.nan
-
-# Check if family composition changed over years
-family_years = df_clean.groupby('family_id')['Plan_year'].nunique().reset_index()
-family_years.rename(columns={'Plan_year': 'family_years_in_data'}, inplace=True)
+# Find the first claim month for each member in each year
+first_claims = claim_df.groupby(['MVDID_first', 'Plan_year_first']).agg(
+    first_claim_month=('service_month', 'min'),
+    first_claim_date=('SERVICEFROMDATE_min', 'min')
+).reset_index()
 
 # Merge check
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(family_years, on='family_id', how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(first_claims, on=['MVDID_first', 'Plan_year_first'], how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-multi_year_families = family_years[family_years['family_years_in_data'] > 1]['family_id']
+# Calculate days since first claim in plan year
+claim_df['days_since_first_claim'] = (claim_df['SERVICEFROMDATE_min'] - claim_df['first_claim_date']).dt.days
 
-if len(multi_year_families) > 0:
-    family_size_by_year = df_clean[df_clean['family_id'].isin(multi_year_families)].groupby(['family_id', 'Plan_year'])[
-        'family_size'].first().reset_index()
-    family_size_by_year = family_size_by_year.sort_values(['family_id', 'Plan_year'])
+# Flag if this is the member's first claim in the plan year
+claim_df['is_first_claim_in_year'] = (claim_df['SERVICEFROMDATE_min'] == claim_df['first_claim_date']).astype(int)
 
-    # Calculate if family size changed
-    family_size_by_year['prev_family_size'] = family_size_by_year.groupby('family_id')['family_size'].shift(1)
-    family_size_by_year['family_size_changed'] = (
-        ~(family_size_by_year['family_size'] == family_size_by_year['prev_family_size'])).astype(int)
-    family_size_by_year = family_size_by_year[['family_id', 'Plan_year', 'family_size_changed']]
+# Create a feature for members with family size changes
+if 'family_id' in claim_df.columns:
+    # Get number of years each family appears in the data
+    family_years = claim_df.groupby('family_id')['Plan_year_first'].nunique().reset_index()
+    family_years.columns = ['family_id', 'family_years_in_data']
 
-    # Merge check
-    row_count_before = len(df_clean)
-    df_clean = df_clean.merge(family_size_by_year, on=['family_id', 'Plan_year'], how='left')
-    assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+    # Merge family years information
+    row_count_before = len(claim_df)
+    claim_df = claim_df.merge(family_years, on='family_id', how='left')
+    assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-    # Check row count after fillna
-    row_count_before = len(df_clean)
-    df_clean['family_size_changed'] = df_clean['family_size_changed'].fillna(0).astype(int)
-    assert row_count_before == len(df_clean), f"Row count changed from {row_count_before} to {len(df_clean)} after fillna"
-else:
-    df_clean['family_size_changed'] = 0
+    # Only analyze families with multiple years of data
+    multi_year_families = family_years[family_years['family_years_in_data'] > 1]['family_id']
 
-# Calculate what percentage of yearly deductible is paid in first quarter
-df_clean['is_first_quarter'] = (df_clean['service_quarter'] == 1).astype(int)
+    if len(multi_year_families) > 0:
+        # Get one family size record per family-year
+        family_size_by_year = claim_df[claim_df['family_id'].isin(multi_year_families)].groupby(
+            ['family_id', 'Plan_year_first'])['family_size_first'].first().reset_index()
 
-q1_deductibles = df_clean[df_clean['is_first_quarter'] == 1].groupby(['MVDID', 'Plan_year'])[
-    'DEDUCTIBLEAMOUNT'].sum().reset_index()
-q1_deductibles.rename(columns={'DEDUCTIBLEAMOUNT': 'q1_deductible'}, inplace=True)
+        # Sort by family and year
+        family_size_by_year = family_size_by_year.sort_values(['family_id', 'Plan_year_first'])
 
-yearly_deductibles = df_clean.groupby(['MVDID', 'Plan_year'])['DEDUCTIBLEAMOUNT'].sum().reset_index()
-yearly_deductibles.rename(columns={'DEDUCTIBLEAMOUNT': 'yearly_deductible'}, inplace=True)
+        # Calculate if family size changed from previous year
+        family_size_by_year['prev_family_size'] = family_size_by_year.groupby('family_id')['family_size_first'].shift(1)
+        family_size_by_year['family_size_changed'] = (~(family_size_by_year['family_size_first'] ==
+                                                     family_size_by_year['prev_family_size'])).astype(int)
+        family_size_by_year = family_size_by_year[['family_id', 'Plan_year_first', 'family_size_changed']]
 
-# Merge both to create deductible_timing dataframe
-# Merge check for first merge in deductible_timing creation
-row_count_before = len(yearly_deductibles)
-deductible_timing = q1_deductibles.merge(yearly_deductibles, on=['MVDID', 'Plan_year'], how='right')
-# No assert here since this is a different merge pattern (right join to yearly_deductibles)
+        # Merge back to claim data
+        row_count_before = len(claim_df)
+        claim_df = claim_df.merge(family_size_by_year, on=['family_id', 'Plan_year_first'], how='left')
+        assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-deductible_timing['q1_deductible'] = deductible_timing['q1_deductible'].fillna(0)
-deductible_timing['q1_deductible_pct'] = deductible_timing['q1_deductible'] / deductible_timing[
-    'yearly_deductible'].replace(0, np.nan)
-deductible_timing = deductible_timing[['MVDID', 'Plan_year', 'q1_deductible_pct']]
+        # Fill missing values
+        claim_df['family_size_changed'] = claim_df['family_size_changed'].fillna(0).astype(int)
+    else:
+        claim_df['family_size_changed'] = 0
 
-# Merge check for final merge back to df_clean
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(deductible_timing, on=['MVDID', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+################ PART 6. Company and Plan-Level Features at Claim Level ##################
 
-################     PART 6. Company and Plan-Level Features       ##################
-# Analyze deductible patterns at the company level
-company_deduct_stats = df_clean.groupby(['COMPANY_KEY', 'Plan_year']).agg({
-    'DEDUCTIBLEAMOUNT': ['mean', 'std', 'median'],
-    'member_total_deductible': ['mean', 'std', 'median'],
-    # 'family_total_deductible' is missing from your DataFrame
-    # Replacing with 'fam_total_deduct_amount' which appears to be available
+# Calculate company-level statistics using claim-level data
+company_deduct_stats = claim_df.groupby(['COMPANY_KEY_first', 'Plan_year_first']).agg({
+    'DEDUCTIBLEAMOUNT_sum': ['mean', 'std', 'median'],
+    'member_fam_deduct_amount': ['mean', 'std', 'median'],
     'fam_total_deduct_amount': ['mean', 'std', 'median'],
-    'family_size': 'mean',
-    'unique_family_members': 'mean'
+    'family_size_first': 'mean'
 })
 
 # Flatten the column hierarchy
@@ -774,37 +546,196 @@ company_deduct_stats.columns = ['_'.join(col).strip() for col in company_deduct_
 company_deduct_stats = company_deduct_stats.reset_index()
 
 # Calculate coefficient of variation
-company_deduct_stats['company_deductible_cv'] = company_deduct_stats['DEDUCTIBLEAMOUNT_std'] / company_deduct_stats['DEDUCTIBLEAMOUNT_mean'].replace(0, np.nan)
-company_deduct_stats['company_member_deductible_cv'] = company_deduct_stats['member_total_deductible_std'] / company_deduct_stats['member_total_deductible_mean'].replace(0, np.nan)
-# Adjust this line to use fam_total_deduct_amount
-company_deduct_stats['company_family_deductible_cv'] = company_deduct_stats['fam_total_deduct_amount_std'] / company_deduct_stats['fam_total_deduct_amount_mean'].replace(0, np.nan)
+company_deduct_stats['company_deductible_cv'] = (
+    company_deduct_stats['DEDUCTIBLEAMOUNT_sum_std'] /
+    company_deduct_stats['DEDUCTIBLEAMOUNT_sum_mean'].replace(0, np.nan)
+)
+company_deduct_stats['company_member_deductible_cv'] = (
+    company_deduct_stats['member_fam_deduct_amount_std'] /
+    company_deduct_stats['member_fam_deduct_amount_mean'].replace(0, np.nan)
+)
+company_deduct_stats['company_family_deductible_cv'] = (
+    company_deduct_stats['fam_total_deduct_amount_std'] /
+    company_deduct_stats['fam_total_deduct_amount_mean'].replace(0, np.nan)
+)
 
 # Keep only computed columns to merge back
-company_cols = ['COMPANY_KEY', 'Plan_year', 'company_deductible_cv', 'company_member_deductible_cv',
-                'company_family_deductible_cv', 'DEDUCTIBLEAMOUNT_mean', 'member_total_deductible_mean',
-                'fam_total_deduct_amount_mean', 'family_size_mean']  # Changed family_total_deductible_mean to fam_total_deduct_amount_mean
+company_cols = [
+    'COMPANY_KEY_first', 'Plan_year_first',
+    'company_deductible_cv', 'company_member_deductible_cv', 'company_family_deductible_cv',
+    'DEDUCTIBLEAMOUNT_sum_mean', 'member_fam_deduct_amount_mean',
+    'fam_total_deduct_amount_mean', 'family_size_first_mean'
+]
 company_deduct_stats = company_deduct_stats[company_cols]
 
-row_count_before = len(df_clean)
-# Merge back to main dataset
-df_clean = df_clean.merge(company_deduct_stats, on=['COMPANY_KEY', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+# Merge back to main dataset with check
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(company_deduct_stats, on=['COMPANY_KEY_first', 'Plan_year_first'], how='left')
+assert row_count_before == len(claim_df), f"Merge changed row count from {row_count_before} to {len(claim_df)}"
 
-# Calculate deductible amount relative to company average
-df_clean['deductible_to_company_avg'] = df_clean['DEDUCTIBLEAMOUNT'] / df_clean['DEDUCTIBLEAMOUNT_mean'].replace(0, np.nan)
-df_clean['member_deductible_to_company_avg'] = df_clean['member_total_deductible'] / df_clean['member_total_deductible_mean'].replace(0, np.nan)
+# Calculate claim deductible relative to company average
+claim_df['deductible_to_company_avg'] = (
+    claim_df['DEDUCTIBLEAMOUNT_sum'] /
+    claim_df['DEDUCTIBLEAMOUNT_sum_mean'].replace(0, np.nan)
+)
+claim_df['member_deductible_to_company_avg'] = (
+    claim_df['member_fam_deduct_amount'] /
+    claim_df['member_fam_deduct_amount_mean'].replace(0, np.nan)
+)
+claim_df['family_deductible_to_company_avg'] = (
+    claim_df['fam_total_deduct_amount'] /
+    claim_df['fam_total_deduct_amount_mean'].replace(0, np.nan)
+)
 
-# Adjust this line to use fam_total_deduct_amount
-df_clean['family_deductible_to_company_avg'] = df_clean['fam_total_deduct_amount'] / df_clean['fam_total_deduct_amount_mean'].replace(0, np.nan)
-df_clean.info()
-
+# Fill NaN values with 0 for ratio columns
+ratio_cols = [
+    'company_deductible_cv', 'company_member_deductible_cv', 'company_family_deductible_cv',
+    'deductible_to_company_avg', 'member_deductible_to_company_avg', 'family_deductible_to_company_avg'
+]
+claim_df[ratio_cols] = claim_df[ratio_cols].fillna(0)
 
 # Define the output path using your specified directory
 output_dir = r"R:\GraduateStudents\WatsonWilliamP\ML_DL_Deduc_Classification\Data"
 
-# Save as CSV
-csv_path = os.path.join(output_dir, "claimline_level_data.csv")
-df_clean.to_csv(csv_path, index=False)
-print(f"Claimline data saved to {csv_path}")
 
+################ PART 7. Demographics and Comorbidity Features ##################
+
+# GENDER FEATURES
+claim_df['is_female'] = (claim_df['PATIENTGENDER_first'].str.upper() == 'F').astype(int)
+claim_df['is_male'] = (claim_df['PATIENTGENDER_first'].str.upper() == 'M').astype(int)
+
+# Count gender distribution within families
+gender_by_family = claim_df.groupby(['family_id', 'PATIENTGENDER_first']).size().unstack(fill_value=0)
+if 'F' in gender_by_family.columns and 'M' in gender_by_family.columns:
+    gender_by_family['total'] = gender_by_family['F'] + gender_by_family['M']
+    gender_by_family['female_ratio'] = gender_by_family['F'] / gender_by_family['total']
+    gender_by_family['family_gender_composition'] = 'mixed'
+    gender_by_family.loc[gender_by_family['female_ratio'] == 1, 'family_gender_composition'] = 'all_female'
+    gender_by_family.loc[gender_by_family['female_ratio'] == 0, 'family_gender_composition'] = 'all_male'
+    gender_by_family = gender_by_family.reset_index()
+
+    # Merge to claim level
+    row_count_before = len(claim_df)
+    claim_df = claim_df.merge(
+        gender_by_family[['family_id', 'female_ratio', 'family_gender_composition']],
+        on='family_id', how='left'
+    )
+    assert row_count_before == len(claim_df), "Merge changed row count"
+
+# AGE FEATURES
+claim_df['age'] = claim_df['age_at_plan_year_start_first']
+claim_df['age_category'] = pd.cut(
+    claim_df['age'],
+    bins=[0, 18, 26, 35, 50, 64, 100],
+    labels=['0-18', '19-26', '27-35', '36-50', '51-64', '65+']
+)
+
+# Family age distribution
+family_ages = claim_df.groupby('family_id')['age'].agg(['min', 'max', 'mean', 'std']).reset_index()
+family_ages.columns = ['family_id', 'family_youngest_age', 'family_oldest_age', 'family_mean_age', 'family_age_std']
+family_ages['family_age_range'] = family_ages['family_oldest_age'] - family_ages['family_youngest_age']
+family_ages['family_has_children'] = (family_ages['family_youngest_age'] < 18).astype(int)
+family_ages['family_has_seniors'] = (family_ages['family_oldest_age'] >= 65).astype(int)
+
+# Create family life stage variable
+family_ages['family_life_stage'] = 'other'
+family_ages.loc[(family_ages['family_has_children'] == 1), 'family_life_stage'] = 'has_children'
+family_ages.loc[(family_ages['family_mean_age'] < 30) & (family_ages['family_has_children'] == 0), 'family_life_stage'] = 'young_adults'
+family_ages.loc[(family_ages['family_mean_age'] >= 30) & (family_ages['family_mean_age'] < 50) & (family_ages['family_has_children'] == 0), 'family_life_stage'] = 'middle_age'
+family_ages.loc[(family_ages['family_mean_age'] >= 50) & (family_ages['family_has_seniors'] == 0), 'family_life_stage'] = 'mature'
+family_ages.loc[(family_ages['family_has_seniors'] == 1), 'family_life_stage'] = 'senior'
+
+row_count_before = len(claim_df)
+claim_df = claim_df.merge(family_ages, on='family_id', how='left')
+assert row_count_before == len(claim_df), "Merge changed row count"
+
+# COMORBIDITY FEATURES
+try:
+    from pyhealth.medcode import InnerMap
+    from pyhealth.medcode.utils import charlson_comorbidity
+
+    icd2comorbid = InnerMap.load("icd10cm")
+
+    # Process claim-level diagnosis codes
+    icd_codes = claim_df.groupby('CLAIMNUMBER')['CODEVALUE_first'].apply(list).reset_index()
+
+    # Function to calculate Charlson comorbidity score and identify conditions
+    def get_charlson_features(codes):
+        # Filter and standardize codes
+        valid_codes = [str(code).strip().upper() for code in codes if isinstance(code, (str, int, float))]
+
+        if not valid_codes:
+            # Default values if no valid codes
+            result = {
+                'charlson_score': 0,
+                'charlson_conditions': 0
+            }
+            return pd.Series(result)
+
+        # Get Charlson comorbidities
+        charlson_dict = charlson_comorbidity(valid_codes, code_type="icd10cm", use_mapping=icd2comorbid)
+
+        # Calculate score and condition count
+        result = {
+            'charlson_score': sum(charlson_dict.values()),
+            'charlson_conditions': sum(1 for val in charlson_dict.values() if val > 0)
+        }
+
+        return pd.Series(result)
+
+    # Apply to each claim
+    charlson_results = icd_codes.apply(lambda row: get_charlson_features(row['CODEVALUE_first']), axis=1)
+
+    # Add claim number
+    charlson_results['CLAIMNUMBER'] = icd_codes['CLAIMNUMBER']
+
+    # Merge to claim data
+    row_count_before = len(claim_df)
+    claim_df = claim_df.merge(charlson_results, on='CLAIMNUMBER', how='left')
+    assert row_count_before == len(claim_df), "Merge changed row count"
+
+    # Fill NaN values
+    comorbidity_cols = [col for col in charlson_results.columns if col != 'CLAIMNUMBER']
+    claim_df[comorbidity_cols] = claim_df[comorbidity_cols].fillna(0)
+
+    # Create simplified comorbidity category
+    claim_df['comorbidity_level'] = pd.cut(
+        claim_df['charlson_score'],
+        bins=[-0.1, 0, 1, 2, 100],
+        labels=['none', 'mild', 'moderate', 'severe']
+    )
+
+except (ImportError, ModuleNotFoundError):
+    # Handle case where pyhealth is not available
+    claim_df['charlson_score'] = 0
+    claim_df['charlson_conditions'] = 0
+    claim_df['comorbidity_level'] = 'none'
+
+
+# ONE-HOT ENCODING FOR CATEGORICAL VARIABLES
+# This creates binary indicator columns for each category
+
+# For age categories
+age_dummies = pd.get_dummies(claim_df['age_category'], prefix='age', drop_first=False)
+claim_df = pd.concat([claim_df, age_dummies], axis=1)
+
+# For family gender composition
+gender_comp_dummies = pd.get_dummies(claim_df['family_gender_composition'], prefix='gender_comp', drop_first=False)
+claim_df = pd.concat([claim_df, gender_comp_dummies], axis=1)
+
+# For family life stage
+life_stage_dummies = pd.get_dummies(claim_df['family_life_stage'], prefix='life_stage', drop_first=False)
+claim_df = pd.concat([claim_df, life_stage_dummies], axis=1)
+
+# For comorbidity level
+comorbidity_dummies = pd.get_dummies(claim_df['comorbidity_level'], prefix='comorbidity', drop_first=False)
+claim_df = pd.concat([claim_df, comorbidity_dummies], axis=1)
+
+# Set the output directory to the specified network path
+output_dir = r"R:\GraduateStudents\WatsonWilliamP\ML_DL_Deduc_Classification\Data"
+
+# Save the claim-level dataset
+csv_path = os.path.join(output_dir, "claim_level_features.csv")
+claim_df.to_csv(csv_path, index=False)
+print(f"Claim-level dataset with {claim_df.shape[1]} features saved to {csv_path}")
 
