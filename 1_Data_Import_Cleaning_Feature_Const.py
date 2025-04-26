@@ -361,9 +361,6 @@ row_count_before = len(df_clean)
 df_clean = df_clean.merge(family_deduct_temp, on=['family_id', 'Plan_year'], how='left')
 assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
-#########Everything up to here, the joins are good###############
-
-
 # Step 2: Calculate family contribution metrics
 # Calculate member's contribution percentage to family deductible
 df_clean['member_deduct_contribution_pct'] = df_clean['member_fam_deduct_amount'] / df_clean[
@@ -373,39 +370,36 @@ df_clean['member_deduct_contribution_pct'] = df_clean['member_fam_deduct_amount'
 family_max = member_fam_deduct.groupby(['family_id', 'Plan_year'])['member_fam_deduct_amount'].max().reset_index()
 family_max.rename(columns={'member_fam_deduct_amount': 'family_max_member_deduct'}, inplace=True)
 
-# Add merge check here
-row_count_before = len(df_clean)
-df_clean = df_clean.merge(family_max, on=['family_id', 'Plan_year'], how='left')
-assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+# Create the groups
+family_groups = member_fam_deduct.groupby(['family_id', 'Plan_year'])
 
-
-# Calculate variation metrics - using a function to avoid repetitive calculations
+# Define the family deductible stats calculation function with NumPy functions
 def calc_family_deduct_stats(x):
     if len(x) <= 1:
-        return pd.Series({
+        return {
             'fam_deduct_variation': 0,
             'fam_deduct_max_to_mean': 1,
             'fam_deduct_skew': 0,
             'fam_deduct_gini': 0
-        })
+        }
 
-    mean = x.mean()
+    mean = np.mean(x)
     if mean == 0:
-        return pd.Series({
+        return {
             'fam_deduct_variation': 0,
             'fam_deduct_max_to_mean': 1 if len(x) > 0 else 0,
             'fam_deduct_skew': 0,
             'fam_deduct_gini': 0
-        })
+        }
 
     # Coefficient of variation
-    cv = x.std() / mean if mean > 0 else 0
+    cv = np.std(x) / mean if mean > 0 else 0
 
     # Max to mean ratio
-    max_to_mean = x.max() / mean if mean > 0 else 0
+    max_to_mean = np.max(x) / mean if mean > 0 else 0
 
     # Simple skew calculation
-    median = x.median()
+    median = np.median(x)
     skew = (mean - median) / mean if mean > 0 else 0
 
     # Simple Gini coefficient (measure of inequality)
@@ -414,21 +408,48 @@ def calc_family_deduct_stats(x):
     index = np.arange(1, n + 1)
     gini = (np.sum((2 * index - n - 1) * sorted_x)) / (n * np.sum(sorted_x)) if np.sum(sorted_x) > 0 else 0
 
-    return pd.Series({
+    return {
         'fam_deduct_variation': cv,
         'fam_deduct_max_to_mean': max_to_mean,
         'fam_deduct_skew': skew,
         'fam_deduct_gini': gini
-    })
+    }
 
 
-# Calculate the statistics at the family-year level
-family_stats = member_fam_deduct.groupby(['family_id', 'Plan_year'])['member_fam_deduct_amount'].apply(
-    calc_family_deduct_stats).reset_index()
+# Now run the alternative approach
+# More efficient collection method
+results = []
 
-# Add merge check here
+# Process each group and store results
+for (family_id, plan_year), group in family_groups:
+    x = group['member_fam_deduct_amount'].values
+
+    # Get stats using your function
+    stats = calc_family_deduct_stats(x)
+
+    # Add to results with explicit keys
+    new_row = {'family_id': family_id, 'Plan_year': plan_year}
+    new_row.update(stats)
+    results.append(new_row)
+
+# Convert results to DataFrame after loop completes
+family_stats_alt = pd.DataFrame(results)
+
+# Verify no duplicates
+assert family_stats_alt.duplicated(subset=['family_id', 'Plan_year']).sum() == 0
+
+# Now perform the merge
 row_count_before = len(df_clean)
-df_clean = df_clean.merge(family_stats, on=['family_id', 'Plan_year'], how='left')
+df_clean = df_clean.merge(family_stats_alt, on=['family_id', 'Plan_year'], how='left')
+assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
+
+# First create the family_max_member_deduct column
+family_max_deduct = member_fam_deduct.groupby(['family_id', 'Plan_year'])['member_fam_deduct_amount'].max().reset_index()
+family_max_deduct.rename(columns={'member_fam_deduct_amount': 'family_max_member_deduct'}, inplace=True)
+
+# Merge this into df_clean
+row_count_before = len(df_clean)
+df_clean = df_clean.merge(family_max_deduct, on=['family_id', 'Plan_year'], how='left')
 assert row_count_before == len(df_clean), f"Merge changed row count from {row_count_before} to {len(df_clean)}"
 
 # Step 3: Calculate additional family structure metrics
@@ -776,3 +797,14 @@ df_clean['member_deductible_to_company_avg'] = df_clean['member_total_deductible
 # Adjust this line to use fam_total_deduct_amount
 df_clean['family_deductible_to_company_avg'] = df_clean['fam_total_deduct_amount'] / df_clean['fam_total_deduct_amount_mean'].replace(0, np.nan)
 df_clean.info()
+
+
+# Define the output path using your specified directory
+output_dir = r"R:\GraduateStudents\WatsonWilliamP\ML_DL_Deduc_Classification\Data"
+
+# Save as CSV
+csv_path = os.path.join(output_dir, "claimline_level_data.csv")
+df_clean.to_csv(csv_path, index=False)
+print(f"Claimline data saved to {csv_path}")
+
+
