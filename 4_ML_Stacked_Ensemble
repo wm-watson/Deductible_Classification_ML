@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split, cross_val_predict, StratifiedKFold
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold, learning_curve
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
@@ -16,6 +16,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier,
 from sklearn.linear_model import LogisticRegression
 import xgboost as xgb
 import lightgbm as lgb
+import catboost as cb
 from time import time
 import os
 import joblib
@@ -27,41 +28,71 @@ warnings.filterwarnings('ignore')
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
-# Define directory to save outputs
+# Define directories for inputs and outputs
+input_dir = r"R:\GraduateStudents\WatsonWilliamP\ML_DL_Deduc_Classification\Data"
 output_dir = "stacked_model_outputs"
 os.makedirs(output_dir, exist_ok=True)
 
 
-# Function to load data - replace with your data loading logic
-def load_data(file_path):
-    """Load data from file and split features and target."""
-    # For this example, we'll create synthetic data
-    # Replace this with your actual data loading code
+# Function to load data from the original dataset using the top 20 features
+def load_data(file_path=None):
+    """Load data using the top 20 features from feature importance results."""
+    print("Building dataset from top 20 features...")
 
-    # If you have a CSV file, uncomment this:
-    # df = pd.read_csv(file_path)
-    # X = df.drop('target', axis=1)
-    # y = df['target']
+    # Load the feature importance results
+    feature_importance_path = os.path.join(input_dir, "feature_importance_agg_vs_emb.csv")
+    all_scores = pd.read_csv(feature_importance_path)
 
-    # Creating synthetic data for demonstration
-    from sklearn.datasets import make_classification
-    X, y = make_classification(
-        n_samples=10000,
-        n_features=20,
-        n_informative=10,
-        n_redundant=5,
-        random_state=RANDOM_STATE
+    # Get top 20 features
+    top_features = all_scores.head(20)['Feature'].tolist()
+    print(f"Using these top 20 features: {top_features}")
+
+    # Load the original dataset
+    claim_df_path = os.path.join(input_dir, "claim_level_features.csv")
+    print(f"Loading original data from {claim_df_path}...")
+    claim_df = pd.read_csv(claim_df_path, low_memory=False)
+
+    # Filter to just Aggregate and Embedded
+    mask = claim_df['DEDUCTIBLE_CATEGORY_first'].isin(['Aggregate', 'Embedded'])
+    filtered_df = claim_df[mask].copy()
+    filtered_df['target'] = (filtered_df['DEDUCTIBLE_CATEGORY_first'] == 'Embedded').astype(int)
+
+    # Make sure all top features exist in the dataset
+    feature_columns = [col for col in top_features if col in filtered_df.columns]
+    if len(feature_columns) < len(top_features):
+        print(f"Warning: Only found {len(feature_columns)}/{len(top_features)} features in the dataset")
+        print(f"Missing features: {set(top_features) - set(feature_columns)}")
+
+    # Get feature data
+    X = filtered_df[feature_columns].copy()
+    y = filtered_df['target']
+
+    # Print class distribution
+    print("\nClass distribution:")
+    print(f"Class 0 (Aggregate): {(y == 0).sum()} ({(y == 0).mean():.2%})")
+    print(f"Class 1 (Embedded): {(y == 1).sum()} ({(y == 1).mean():.2%})")
+    print(f"Imbalance ratio: 1:{(y == 1).sum() / (y == 0).sum():.1f}")
+
+    # Split into train, validation, and test sets (60/20/20)
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.4, random_state=RANDOM_STATE, stratify=y
     )
-    feature_names = [f'feature_{i}' for i in range(X.shape[1])]
-    X = pd.DataFrame(X, columns=feature_names)
-    y = pd.Series(y, name='target')
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=RANDOM_STATE, stratify=y_temp
+    )
 
-    return X, y
+    print(f"Training set: {X_train.shape[0]} samples")
+    print(f"Validation set: {X_val.shape[0]} samples")
+    print(f"Test set: {X_test.shape[0]} samples")
+
+    return X_train, X_val, X_test, y_train, y_val, y_test, feature_columns
 
 
 # Function to preprocess data
 def preprocess_data(X_train, X_val, X_test):
     """Apply preprocessing to features."""
+    print("Preprocessing data...")
+
     # Impute missing values
     imputer = SimpleImputer(strategy='median')
     X_train_imputed = imputer.fit_transform(X_train)
@@ -82,327 +113,321 @@ def preprocess_data(X_train, X_val, X_test):
     return X_train_processed, X_val_processed, X_test_processed, imputer, scaler
 
 
-# Function to build and evaluate a stacked model
+# Function to calculate specificity
+def specificity_score(y_true, y_pred):
+    """Calculate specificity (true negative rate)."""
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return tn / (tn + fp)
+
+
+# Function to build and evaluate stacked ensemble model
 def build_stacked_model(X_train, X_val, X_test, y_train, y_val, y_test):
-    """Build, train and evaluate a stacked ensemble model."""
+    """Build and evaluate a stacked ensemble model."""
+    print("Building stacked ensemble model...")
 
-    print("\nBuilding stacked ensemble model...")
+    # Calculate imbalance ratio for setting weights
+    imbalance_ratio = (y_train == 1).sum() / (y_train == 0).sum()
 
-    # 1. Define base models
+    # 1. Define base models with class imbalance handling
     base_models = [
-        ('rf', RandomForestClassifier(n_estimators=500, n_jobs=-1, random_state=RANDOM_STATE)),
-        ('gb', GradientBoostingClassifier(n_estimators=500, random_state=RANDOM_STATE)),
-        ('xgb', xgb.XGBClassifier(n_estimators=500, n_jobs=-1, random_state=RANDOM_STATE)),
-        ('lgb', lgb.LGBMClassifier(n_estimators=500, n_jobs=-1, random_state=RANDOM_STATE))
+        ('rf', RandomForestClassifier(
+            n_estimators=500,
+            class_weight='balanced',
+            n_jobs=-1,
+            random_state=RANDOM_STATE
+        )),
+        ('gb', GradientBoostingClassifier(
+            n_estimators=500,
+            learning_rate=0.05,
+            max_depth=8,
+            random_state=RANDOM_STATE
+        )),
+        ('xgb', xgb.XGBClassifier(
+            n_estimators=500,
+            learning_rate=0.05,
+            max_depth=10,
+            scale_pos_weight=imbalance_ratio,
+            n_jobs=-1,
+            random_state=RANDOM_STATE
+        )),
+        ('lgb', lgb.LGBMClassifier(
+            n_estimators=500,
+            learning_rate=0.05,
+            num_leaves=128,
+            class_weight='balanced',
+            n_jobs=-1,
+            random_state=RANDOM_STATE
+        ))
     ]
 
-    # 2. Define meta-learner
-    meta_learner = LogisticRegression(C=1.0, solver='lbfgs', max_iter=1000, random_state=RANDOM_STATE)
+    # 2. Define meta-learner (final estimator)
+    meta_learner = LogisticRegression(
+        C=0.1,
+        class_weight='balanced',
+        solver='liblinear',
+        random_state=RANDOM_STATE
+    )
 
-    # 3. Create stacked model
+    # 3. Create and train stacked model
     stacked_model = StackingClassifier(
         estimators=base_models,
         final_estimator=meta_learner,
-        cv=5,  # 5-fold cross-validation
+        cv=5,
         stack_method='predict_proba',
         n_jobs=-1
     )
 
-    # 4. Train and evaluate the model
-    results = {}
-
-    # Train the model
     print("Training stacked model...")
     start_time = time()
     stacked_model.fit(X_train, y_train)
     training_time = time() - start_time
-    results['training_time'] = training_time
     print(f"Training completed in {training_time:.2f} seconds")
 
-    # Get predictions
-    print("Generating predictions...")
-    start_time = time()
-
-    # Make predictions for each dataset
-    datasets = {
-        'train': (X_train, y_train),
-        'val': (X_val, y_val),
-        'test': (X_test, y_test)
-    }
-
-    predictions = {}
-    for dataset_name, (X, y) in datasets.items():
-        y_pred = stacked_model.predict(X)
-        y_pred_proba = stacked_model.predict_proba(X)[:, 1]
-        predictions[dataset_name] = {'y_true': y, 'y_pred': y_pred, 'y_pred_proba': y_pred_proba}
-
-    prediction_time = time() - start_time
-    results['prediction_time'] = prediction_time
-    print(f"Predictions generated in {prediction_time:.2f} seconds")
-
-    # Calculate metrics
-    print("Calculating performance metrics...")
-    for dataset_name, preds in predictions.items():
-        y_true = preds['y_true']
-        y_pred = preds['y_pred']
-        y_pred_proba = preds['y_pred_proba']
-
-        # Classification metrics
-        results[f'{dataset_name}_accuracy'] = accuracy_score(y_true, y_pred)
-        results[f'{dataset_name}_precision'] = precision_score(y_true, y_pred)
-        results[f'{dataset_name}_recall'] = recall_score(y_true, y_pred)
-        results[f'{dataset_name}_f1'] = f1_score(y_true, y_pred)
-        results[f'{dataset_name}_roc_auc'] = roc_auc_score(y_true, y_pred_proba)
-        results[f'{dataset_name}_avg_precision'] = average_precision_score(y_true, y_pred_proba)
-        results[f'{dataset_name}_log_loss'] = log_loss(y_true, y_pred_proba)
-        results[f'{dataset_name}_brier_score'] = brier_score_loss(y_true, y_pred_proba)
-        results[f'{dataset_name}_matthews_corrcoef'] = matthews_corrcoef(y_true, y_pred)
-        results[f'{dataset_name}_cohen_kappa'] = cohen_kappa_score(y_true, y_pred)
-
-        # Confusion matrix components
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-        results[f'{dataset_name}_true_negatives'] = tn
-        results[f'{dataset_name}_false_positives'] = fp
-        results[f'{dataset_name}_false_negatives'] = fn
-        results[f'{dataset_name}_true_positives'] = tp
-        results[f'{dataset_name}_specificity'] = tn / (tn + fp) if (tn + fp) > 0 else 0
-
-    # Print key results
-    print("\nStacked Model Results:")
-    print(f"Training Time: {results['training_time']:.2f} seconds")
-    print(f"Validation Accuracy: {results['val_accuracy']:.4f}")
-    print(f"Validation ROC AUC: {results['val_roc_auc']:.4f}")
-    print(f"Validation F1 Score: {results['val_f1']:.4f}")
-    print(f"Test Accuracy: {results['test_accuracy']:.4f}")
-    print(f"Test ROC AUC: {results['test_roc_auc']:.4f}")
-    print(f"Test F1 Score: {results['test_f1']:.4f}")
-
-    # Create visualizations
-    create_stacked_model_visualizations(
-        predictions['test']['y_true'],
-        predictions['test']['y_pred'],
-        predictions['test']['y_pred_proba'],
-        base_models,
-        X_test,
-        y_test
-    )
-
-    # Save the model and results
+    # 4. Save the model
     joblib.dump(stacked_model, os.path.join(output_dir, 'stacked_model.joblib'))
-    pd.DataFrame([results]).to_csv(os.path.join(output_dir, 'stacked_model_metrics.csv'), index=False)
 
+    # 5. Make predictions
+    y_train_pred = stacked_model.predict(X_train)
+    y_val_pred = stacked_model.predict(X_val)
+    y_test_pred = stacked_model.predict(X_test)
+
+    y_train_proba = stacked_model.predict_proba(X_train)[:, 1]
+    y_val_proba = stacked_model.predict_proba(X_val)[:, 1]
+    y_test_proba = stacked_model.predict_proba(X_test)[:, 1]
+
+    # 6. Calculate and store metrics
+    results = {}
+    results['training_time'] = training_time
+
+    for name, y_true, y_pred, y_proba in [
+        ('train', y_train, y_train_pred, y_train_proba),
+        ('val', y_val, y_val_pred, y_val_proba),
+        ('test', y_test, y_test_pred, y_test_proba)
+    ]:
+        results[f'{name}_accuracy'] = accuracy_score(y_true, y_pred)
+        results[f'{name}_precision'] = precision_score(y_true, y_pred)
+        results[f'{name}_recall'] = recall_score(y_true, y_pred)  # Sensitivity
+        results[f'{name}_specificity'] = specificity_score(y_true, y_pred)
+        results[f'{name}_f1'] = f1_score(y_true, y_pred)
+        results[f'{name}_roc_auc'] = roc_auc_score(y_true, y_proba)
+        results[f'{name}_avg_precision'] = average_precision_score(y_true, y_proba)
+        results[f'{name}_log_loss'] = log_loss(y_true, y_proba)
+        results[f'{name}_brier_score'] = brier_score_loss(y_true, y_proba)
+        results[f'{name}_matthews_corrcoef'] = matthews_corrcoef(y_true, y_pred)
+        results[f'{name}_cohen_kappa'] = cohen_kappa_score(y_true, y_pred)
+
+    # 7. Print results
+    print("\nStacked Model Performance:")
+    print(
+        f"Training - Accuracy: {results['train_accuracy']:.4f}, ROC-AUC: {results['train_roc_auc']:.4f}, F1: {results['train_f1']:.4f}")
+    print(
+        f"Validation - Accuracy: {results['val_accuracy']:.4f}, ROC-AUC: {results['val_roc_auc']:.4f}, F1: {results['val_f1']:.4f}")
+    print(
+        f"Test - Accuracy: {results['test_accuracy']:.4f}, ROC-AUC: {results['test_roc_auc']:.4f}, F1: {results['test_f1']:.4f}")
+    print(
+        f"Test - Precision: {results['test_precision']:.4f}, Recall: {results['test_recall']:.4f}, Specificity: {results['test_specificity']:.4f}")
+
+    # 8. Save classification report
+    with open(os.path.join(output_dir, 'classification_report.txt'), 'w') as f:
+        f.write("Stacked Ensemble Model - Classification Report\n\n")
+        f.write(classification_report(y_test, y_test_pred))
+
+    # 9. Create and save visualizations
+    # Confusion Matrix
+    plt.figure(figsize=(8, 7))
+    cm = confusion_matrix(y_test, y_test_pred)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False)
+    plt.title('Stacked Model - Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'stacked_model_confusion_matrix.png'))
+    plt.close()
+
+    # ROC Curve
+    plt.figure(figsize=(8, 7))
+    fpr, tpr, _ = roc_curve(y_test, y_test_proba)
+    plt.plot(fpr, tpr, lw=2, label=f'Stacked Model (AUC = {results["test_roc_auc"]:.4f})')
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Stacked Model - ROC Curve')
+    plt.legend(loc='lower right')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'stacked_model_roc_curve.png'))
+    plt.close()
+
+    # Precision-Recall Curve
+    plt.figure(figsize=(8, 7))
+    precision, recall, _ = precision_recall_curve(y_test, y_test_proba)
+    plt.plot(recall, precision, lw=2, label=f'Stacked Model (AP = {results["test_avg_precision"]:.4f})')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Stacked Model - Precision-Recall Curve')
+    plt.legend(loc='best')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'stacked_model_pr_curve.png'))
+    plt.close()
+
+    # Calibration Curve
+    plt.figure(figsize=(8, 7))
+    prob_true, prob_pred = calibration_curve(y_test, y_test_proba, n_bins=10)
+    plt.plot(prob_pred, prob_true, 's-', label='Stacked Model')
+    plt.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated')
+    plt.xlabel('Mean predicted probability')
+    plt.ylabel('Fraction of positives')
+    plt.title('Stacked Model - Calibration Curve')
+    plt.legend(loc='best')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'stacked_model_calibration_curve.png'))
+    plt.close()
+
+    # 10. Save results to CSV
+    results_df = pd.DataFrame({
+        'Metric': [
+            'Accuracy', 'Precision', 'Recall (Sensitivity)', 'Specificity', 'F1 Score',
+            'ROC AUC', 'Average Precision', 'Log Loss', 'Brier Score',
+            'Matthews Correlation', 'Cohen Kappa', 'Training Time (s)'
+        ],
+        'Train': [
+            results['train_accuracy'], results['train_precision'], results['train_recall'],
+            results['train_specificity'], results['train_f1'], results['train_roc_auc'],
+            results['train_avg_precision'], results['train_log_loss'], results['train_brier_score'],
+            results['train_matthews_corrcoef'], results['train_cohen_kappa'], results['training_time']
+        ],
+        'Validation': [
+            results['val_accuracy'], results['val_precision'], results['val_recall'],
+            results['val_specificity'], results['val_f1'], results['val_roc_auc'],
+            results['val_avg_precision'], results['val_log_loss'], results['val_brier_score'],
+            results['val_matthews_corrcoef'], results['val_cohen_kappa'], '-'
+        ],
+        'Test': [
+            results['test_accuracy'], results['test_precision'], results['test_recall'],
+            results['test_specificity'], results['test_f1'], results['test_roc_auc'],
+            results['test_avg_precision'], results['test_log_loss'], results['test_brier_score'],
+            results['test_matthews_corrcoef'], results['test_cohen_kappa'], '-'
+        ]
+    })
+
+    results_df.to_csv(os.path.join(output_dir, 'stacked_model_results.csv'), index=False)
+
+    # Return model, results, and base models for further analysis
     return stacked_model, results, base_models
 
 
-# Function to create visualizations for stacked model
-def create_stacked_model_visualizations(y_true, y_pred, y_pred_proba, base_models, X_test, y_test):
-    """Create and save visualizations for stacked model evaluation."""
+# Function to create learning curves
+def create_learning_curves(model, X, y):
+    """Create and save learning curves for the model."""
+    # Set up the figure
+    plt.figure(figsize=(10, 8))
 
-    # Create a figure with multiple subplots
-    fig, axes = plt.subplots(2, 2, figsize=(20, 16))
-    fig.suptitle("Stacked Ensemble Model Performance Evaluation", fontsize=16)
+    # Calculate learning curve
+    train_sizes, train_scores, test_scores = learning_curve(
+        model, X, y,
+        cv=5,
+        scoring='roc_auc',
+        train_sizes=np.linspace(0.1, 1.0, 10),
+        random_state=RANDOM_STATE,
+        n_jobs=-1
+    )
 
-    # 1. Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred)
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=axes[0, 0])
-    axes[0, 0].set_title("Confusion Matrix")
-    axes[0, 0].set_xlabel("Predicted Label")
-    axes[0, 0].set_ylabel("True Label")
+    # Calculate mean and std for training and test scores
+    train_mean = np.mean(train_scores, axis=1)
+    train_std = np.std(train_scores, axis=1)
+    test_mean = np.mean(test_scores, axis=1)
+    test_std = np.std(test_scores, axis=1)
 
-    # 2. ROC Curve
-    fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
-    roc_auc = roc_auc_score(y_true, y_pred_proba)
-    axes[0, 1].plot(fpr, tpr, label=f'Stacked Model (area = {roc_auc:.3f})')
-    axes[0, 1].plot([0, 1], [0, 1], 'k--')
-    axes[0, 1].set_xlim([0.0, 1.0])
-    axes[0, 1].set_ylim([0.0, 1.05])
-    axes[0, 1].set_xlabel('False Positive Rate')
-    axes[0, 1].set_ylabel('True Positive Rate')
-    axes[0, 1].set_title('Receiver Operating Characteristic')
-    axes[0, 1].legend(loc="lower right")
+    # Plot learning curve
+    plt.plot(train_sizes, train_mean, 'o-', color='blue', label='Training Score')
+    plt.fill_between(train_sizes, train_mean - train_std, train_mean + train_std, alpha=0.1, color='blue')
 
-    # 3. Precision-Recall Curve
-    precision, recall, _ = precision_recall_curve(y_true, y_pred_proba)
-    avg_precision = average_precision_score(y_true, y_pred_proba)
-    axes[1, 0].plot(recall, precision, label=f'Stacked Model (AP = {avg_precision:.3f})')
-    axes[1, 0].set_xlabel('Recall')
-    axes[1, 0].set_ylabel('Precision')
-    axes[1, 0].set_title('Precision-Recall Curve')
-    axes[1, 0].legend(loc="lower left")
+    plt.plot(train_sizes, test_mean, 'o-', color='red', label='Cross-validation Score')
+    plt.fill_between(train_sizes, test_mean - test_std, test_mean + test_std, alpha=0.1, color='red')
 
-    # 4. Calibration Curve
-    prob_true, prob_pred = calibration_curve(y_true, y_pred_proba, n_bins=10)
-    axes[1, 1].plot(prob_pred, prob_true, marker='o', linewidth=1, label='Stacked Model')
-    axes[1, 1].plot([0, 1], [0, 1], 'k--')
-    axes[1, 1].set_xlabel('Mean Predicted Probability')
-    axes[1, 1].set_ylabel('Fraction of Positives')
-    axes[1, 1].set_title('Calibration Curve')
-    axes[1, 1].legend(loc="lower right")
+    plt.title('Learning Curve - Stacked Ensemble (ROC AUC)')
+    plt.xlabel('Training Examples')
+    plt.ylabel('ROC AUC Score')
+    plt.grid(True)
+    plt.legend(loc='best')
+    plt.tight_layout()
 
-    # Adjust layout and save
-    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Make room for the suptitle
-    plt.savefig(os.path.join(output_dir, "stacked_model_evaluation.png"))
+    # Save the figure
+    plt.savefig(os.path.join(output_dir, 'learning_curve.png'))
     plt.close()
 
-    # Compare stacked model with base models
-    compare_with_base_models(base_models, X_test, y_test, y_pred_proba)
 
+# Function to analyze predictions
+def analyze_predictions(model, X_test, y_test):
+    """Analyze predictions to gain insights."""
+    # Get predictions
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
 
-# Function to compare stacked model with base models
-def compare_with_base_models(base_models, X_test, y_test, stacked_proba):
-    """Compare stacked model performance with individual base models."""
-
-    # Initialize empty lists to store results
-    model_names = ['Stacked Model']
-    roc_aucs = [roc_auc_score(y_test, stacked_proba)]
-    avg_precisions = [average_precision_score(y_test, stacked_proba)]
-
-    # Get ROC curve for stacked model
-    stacked_fpr, stacked_tpr, _ = roc_curve(y_test, stacked_proba)
-
-    # Get PR curve for stacked model
-    stacked_precision, stacked_recall, _ = precision_recall_curve(y_test, stacked_proba)
-
-    # Train and evaluate base models
-    base_fprs = []
-    base_tprs = []
-    base_precisions = []
-    base_recalls = []
-
-    print("\nComparing base models with stacked model...")
-
-    for name, model in base_models:
-        print(f"Evaluating base model: {name}")
-        # Train model
-        model.fit(X_test, y_test)
-
-        # Get predictions
-        y_pred_proba = model.predict_proba(X_test)[:, 1]
-
-        # Calculate metrics
-        roc_auc = roc_auc_score(y_test, y_pred_proba)
-        avg_precision = average_precision_score(y_test, y_pred_proba)
-
-        # Get ROC curve
-        fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
-        base_fprs.append(fpr)
-        base_tprs.append(tpr)
-
-        # Get PR curve
-        precision, recall, _ = precision_recall_curve(y_test, y_pred_proba)
-        base_precisions.append(precision)
-        base_recalls.append(recall)
-
-        # Add to lists
-        model_names.append(name)
-        roc_aucs.append(roc_auc)
-        avg_precisions.append(avg_precision)
-
-        print(f"{name} - ROC AUC: {roc_auc:.4f}, Average Precision: {avg_precision:.4f}")
-
-    # Create comparison visualizations
-
-    # 1. ROC curves comparison
-    plt.figure(figsize=(12, 10))
-
-    # Plot stacked model
-    plt.plot(stacked_fpr, stacked_tpr,
-             label=f'Stacked Model (AUC = {roc_aucs[0]:.3f})',
-             linewidth=3)
-
-    # Plot base models
-    for i, (name, _) in enumerate(base_models):
-        plt.plot(base_fprs[i], base_tprs[i],
-                 label=f'{name} (AUC = {roc_aucs[i + 1]:.3f})',
-                 linewidth=1.5, alpha=0.7)
-
-    plt.plot([0, 1], [0, 1], 'k--')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curves: Stacked Model vs Base Models')
-    plt.legend(loc='lower right')
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(output_dir, 'roc_comparison.png'))
-    plt.close()
-
-    # 2. Precision-Recall curves comparison
-    plt.figure(figsize=(12, 10))
-
-    # Plot stacked model
-    plt.plot(stacked_recall, stacked_precision,
-             label=f'Stacked Model (AP = {avg_precisions[0]:.3f})',
-             linewidth=3)
-
-    # Plot base models
-    for i, (name, _) in enumerate(base_models):
-        plt.plot(base_recalls[i], base_precisions[i],
-                 label=f'{name} (AP = {avg_precisions[i + 1]:.3f})',
-                 linewidth=1.5, alpha=0.7)
-
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title('Precision-Recall Curves: Stacked Model vs Base Models')
-    plt.legend(loc='lower left')
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(output_dir, 'pr_comparison.png'))
-    plt.close()
-
-    # 3. Metrics bar chart
-    metrics_df = pd.DataFrame({
-        'Model': model_names,
-        'ROC AUC': roc_aucs,
-        'Average Precision': avg_precisions
+    # Create a DataFrame with true labels and predictions
+    pred_df = pd.DataFrame({
+        'True_Label': y_test,
+        'Predicted_Label': y_pred,
+        'Predicted_Probability': y_proba
     })
 
-    # Sort by ROC AUC
-    metrics_df = metrics_df.sort_values('ROC AUC', ascending=False)
+    # Save predictions for further analysis
+    pred_df.to_csv(os.path.join(output_dir, 'predictions.csv'), index=False)
 
-    # Plot
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    # Analyze prediction errors
+    pred_df['Error'] = (pred_df['True_Label'] != pred_df['Predicted_Label']).astype(int)
 
-    # ROC AUC
-    metrics_df.plot(kind='bar', x='Model', y='ROC AUC', ax=axes[0], legend=False, color='skyblue')
-    axes[0].set_title('ROC AUC Score Comparison')
-    axes[0].set_ylim([min(roc_aucs) * 0.95, max(roc_aucs) * 1.02])
-    for i, v in enumerate(metrics_df['ROC AUC']):
-        axes[0].text(i, v + 0.005, f"{v:.3f}", ha='center')
+    # Group by true label and calculate error rates
+    error_rates = pred_df.groupby('True_Label')['Error'].mean().reset_index()
+    error_rates.columns = ['True_Label', 'Error_Rate']
 
-    # Average Precision
-    metrics_df.plot(kind='bar', x='Model', y='Average Precision', ax=axes[1], legend=False, color='lightgreen')
-    axes[1].set_title('Average Precision Score Comparison')
-    axes[1].set_ylim([min(avg_precisions) * 0.95, max(avg_precisions) * 1.02])
-    for i, v in enumerate(metrics_df['Average Precision']):
-        axes[1].text(i, v + 0.005, f"{v:.3f}", ha='center')
+    # Save error analysis
+    error_rates.to_csv(os.path.join(output_dir, 'error_analysis.csv'), index=False)
 
+    # Plot error analysis by class
+    plt.figure(figsize=(8, 6))
+    sns.barplot(x='True_Label', y='Error_Rate', data=error_rates)
+    plt.title('Error Rate by Class')
+    plt.xlabel('True Class')
+    plt.ylabel('Error Rate')
+    plt.xticks([0, 1], ['Aggregate', 'Embedded'])
+    plt.grid(axis='y')
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'metrics_comparison.png'))
+    plt.savefig(os.path.join(output_dir, 'error_by_class.png'))
     plt.close()
 
-    # Save metrics to CSV
-    metrics_df.to_csv(os.path.join(output_dir, 'model_comparison.csv'), index=False)
+    # Plot probability distribution by true class
+    plt.figure(figsize=(10, 6))
+    for class_value, label in [(0, 'Aggregate'), (1, 'Embedded')]:
+        class_probs = pred_df[pred_df['True_Label'] == class_value]['Predicted_Probability']
+        sns.kdeplot(class_probs, label=f'True Class: {label}')
+
+    plt.title('Predicted Probability Distribution by True Class')
+    plt.xlabel('Predicted Probability of Embedded Class')
+    plt.ylabel('Density')
+    plt.axvline(x=0.5, color='red', linestyle='--', label='Decision Threshold')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'probability_distribution.png'))
+    plt.close()
 
 
-# Main execution function
-def run_stacked_ensemble_analysis(data_file='data.csv'):
+# Main execution function for stacked model
+def run_stacked_ensemble_analysis(data_file=None):
     """Run stacked ensemble analysis and evaluation."""
 
-    # 1. Load and split data
+    # 1. Load the pre-split datasets
     print("Loading and preparing data...")
-    X, y = load_data(data_file)
-
-    # Split into train, validation, and test sets (60/20/20)
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X, y, test_size=0.4, random_state=RANDOM_STATE, stratify=y
-    )
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.5, random_state=RANDOM_STATE, stratify=y_temp
-    )
+    X_train, X_val, X_test, y_train, y_val, y_test, features = load_data(data_file)
 
     print(
         f"Training set: {X_train.shape[0]} samples, Validation set: {X_val.shape[0]} samples, Test set: {X_test.shape[0]} samples")
 
     # 2. Preprocess data
-    print("Preprocessing data...")
+    print("\nPreprocessing data...")
     X_train_processed, X_val_processed, X_test_processed, imputer, scaler = preprocess_data(
         X_train, X_val, X_test
     )
@@ -428,162 +453,16 @@ def run_stacked_ensemble_analysis(data_file='data.csv'):
     return stacked_model, results
 
 
-# Create learning curves
-def create_learning_curves(model, X_train, y_train):
-    """Generate and plot learning curves."""
-    from sklearn.model_selection import learning_curve
-
-    # Generate learning curve data
-    train_sizes = np.linspace(0.1, 1.0, 10)
-    train_sizes, train_scores, val_scores = learning_curve(
-        model, X_train, y_train,
-        train_sizes=train_sizes,
-        cv=5,
-        scoring='roc_auc',
-        n_jobs=-1,
-        random_state=RANDOM_STATE
-    )
-
-    # Calculate mean and std
-    train_mean = np.mean(train_scores, axis=1)
-    train_std = np.std(train_scores, axis=1)
-    val_mean = np.mean(val_scores, axis=1)
-    val_std = np.std(val_scores, axis=1)
-
-    # Plot learning curves
-    plt.figure(figsize=(10, 6))
-    plt.grid(True, alpha=0.3)
-
-    # Plot mean training and validation scores
-    plt.plot(train_sizes, train_mean, 'o-', color='blue', label='Training AUC')
-    plt.plot(train_sizes, val_mean, 'o-', color='red', label='CV AUC')
-
-    # Plot standard deviation bands
-    plt.fill_between(train_sizes, train_mean - train_std, train_mean + train_std,
-                     alpha=0.1, color='blue')
-    plt.fill_between(train_sizes, val_mean - val_std, val_mean + val_std,
-                     alpha=0.1, color='red')
-
-    # Labels and title
-    plt.xlabel('Training Set Size')
-    plt.ylabel('ROC AUC Score')
-    plt.title('Learning Curves for Stacked Ensemble Model')
-    plt.legend(loc='lower right')
-
-    # Save figure
-    plt.savefig(os.path.join(output_dir, 'learning_curves.png'))
-    plt.close()
-
-
-# Analyze predictions
-def analyze_predictions(model, X_test, y_test):
-    """Analyze model predictions and errors."""
-
-    # Get predictions
-    y_pred = model.predict(X_test)
-    y_pred_proba = model.predict_proba(X_test)[:, 1]
-
-    # Convert data for analysis
-    X_test_np = X_test.values
-
-    # Create a DataFrame with test data, true labels, and predictions
-    analysis_df = pd.DataFrame(X_test_np, columns=X_test.columns)
-    analysis_df['true_label'] = y_test
-    analysis_df['predicted_label'] = y_pred
-    analysis_df['predicted_probability'] = y_pred_proba
-    analysis_df['correct'] = analysis_df['true_label'] == analysis_df['predicted_label']
-
-    # Calculate error
-    analysis_df['error'] = np.abs(analysis_df['true_label'] - analysis_df['predicted_probability'])
-
-    # Get correct and incorrect predictions
-    correct_predictions = analysis_df[analysis_df['correct']]
-    incorrect_predictions = analysis_df[~analysis_df['correct']]
-
-    # Calculate confidence distribution
-    correct_conf = correct_predictions['predicted_probability'].where(
-        correct_predictions['true_label'] == 1,
-        1 - correct_predictions['predicted_probability']
-    )
-    incorrect_conf = incorrect_predictions['predicted_probability'].where(
-        incorrect_predictions['true_label'] == 1,
-        1 - incorrect_predictions['predicted_probability']
-    )
-
-    # Bin predictions by confidence
-    bins = [0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    bin_labels = ['0.5-0.6', '0.6-0.7', '0.7-0.8', '0.8-0.9', '0.9-1.0']
-
-    # Get the confidence (probability of predicted class)
-    analysis_df['confidence'] = np.where(
-        analysis_df['predicted_label'] == 1,
-        analysis_df['predicted_probability'],
-        1 - analysis_df['predicted_probability']
-    )
-
-    analysis_df['confidence_bin'] = pd.cut(
-        analysis_df['confidence'],
-        bins=bins,
-        labels=bin_labels,
-        include_lowest=True
-    )
-
-    # Calculate accuracy per confidence bin
-    conf_accuracy = analysis_df.groupby('confidence_bin')['correct'].mean()
-    conf_counts = analysis_df.groupby('confidence_bin')['correct'].count()
-
-    # Plot confidence vs. accuracy
-    plt.figure(figsize=(12, 8))
-
-    # Bar plot for accuracy per bin
-    ax1 = plt.subplot(111)
-    conf_accuracy.plot(kind='bar', color='skyblue', ax=ax1)
-    ax1.set_ylim([0, 1])
-    ax1.set_ylabel('Accuracy')
-    ax1.set_title('Accuracy by Confidence Level')
-
-    # Annotate bars with accuracy and count
-    for i, (acc, count) in enumerate(zip(conf_accuracy, conf_counts)):
-        ax1.annotate(
-            f'{acc:.2f}\n(n={count})',
-            xy=(i, acc + 0.05),
-            ha='center',
-            va='center',
-            fontweight='bold'
-        )
-
-    # Add line at 45 degrees (perfect calibration)
-    ax1.plot([-1, len(bin_labels)], [0, 1], 'k--', alpha=0.5, label='Perfect Calibration')
-    ax1.legend()
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'confidence_analysis.png'))
-    plt.close()
-
-    # Save the most confident errors for review
-    high_conf_errors = incorrect_predictions.sort_values('confidence', ascending=False).head(20)
-    high_conf_errors.to_csv(os.path.join(output_dir, 'high_confidence_errors.csv'))
-
-    # Plot error distribution
-    plt.figure(figsize=(10, 6))
-    plt.hist(correct_conf, bins=20, alpha=0.5, label='Correct Predictions')
-    plt.hist(incorrect_conf, bins=20, alpha=0.5, label='Incorrect Predictions')
-    plt.xlabel('Confidence (Probability of Correct Class)')
-    plt.ylabel('Count')
-    plt.title('Distribution of Model Confidence')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(output_dir, 'confidence_distribution.png'))
-    plt.close()
-
-
-# Execute the analysis
+# Execute the analysis if run as a script
 if __name__ == "__main__":
     stacked_model, results = run_stacked_ensemble_analysis()
-    print("\nStacked ensemble analysis complete. Results saved to:", output_dir)
+    print("\nStacked ensemble analysis complete!")
 
-    # Display final results
-    print("\nFinal Test Set Metrics:")
-    metrics = ['accuracy', 'roc_auc', 'f1', 'precision', 'recall', 'specificity']
-    for metric in metrics:
-        print(f"{metric.replace('_', ' ').title()}: {results[f'test_{metric}']:.4f}")
+    # Print key test metrics
+    print("\nStacked Model Test Performance:")
+    print(f"Accuracy: {results['test_accuracy']:.4f}")
+    print(f"ROC AUC: {results['test_roc_auc']:.4f}")
+    print(f"F1 Score: {results['test_f1']:.4f}")
+    print(f"Precision: {results['test_precision']:.4f}")
+    print(f"Recall (Sensitivity): {results['test_recall']:.4f}")
+    print(f"Specificity: {results['test_specificity']:.4f}")

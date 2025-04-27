@@ -27,41 +27,71 @@ warnings.filterwarnings('ignore')
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
-# Define directory to save outputs
+# Define directories for inputs and outputs
+input_dir = r"R:\GraduateStudents\WatsonWilliamP\ML_DL_Deduc_Classification\Data"
 output_dir = "model_outputs"
 os.makedirs(output_dir, exist_ok=True)
 
 
-# Function to load data - replace with your data loading logic
-def load_data(file_path):
-    """Load data from file and split features and target."""
-    # For this example, we'll create synthetic data
-    # Replace this with your actual data loading code
+# Function to load data from the original dataset using the top 20 features
+def load_data(file_path=None):
+    """Load data using the top 20 features from feature importance results."""
+    print("Building dataset from top 20 features...")
 
-    # If you have a CSV file, uncomment this:
-    # df = pd.read_csv(file_path)
-    # X = df.drop('target', axis=1)
-    # y = df['target']
+    # Load the feature importance results
+    feature_importance_path = os.path.join(input_dir, "feature_importance_agg_vs_emb.csv")
+    all_scores = pd.read_csv(feature_importance_path)
 
-    # Creating synthetic data for demonstration
-    from sklearn.datasets import make_classification
-    X, y = make_classification(
-        n_samples=10000,
-        n_features=20,
-        n_informative=10,
-        n_redundant=5,
-        random_state=RANDOM_STATE
+    # Get top 20 features
+    top_features = all_scores.head(20)['Feature'].tolist()
+    print(f"Using these top 20 features: {top_features}")
+
+    # Load the original dataset
+    claim_df_path = os.path.join(input_dir, "claim_level_features.csv")
+    print(f"Loading original data from {claim_df_path}...")
+    claim_df = pd.read_csv(claim_df_path, low_memory=False)
+
+    # Filter to just Aggregate and Embedded
+    mask = claim_df['DEDUCTIBLE_CATEGORY_first'].isin(['Aggregate', 'Embedded'])
+    filtered_df = claim_df[mask].copy()
+    filtered_df['target'] = (filtered_df['DEDUCTIBLE_CATEGORY_first'] == 'Embedded').astype(int)
+
+    # Make sure all top features exist in the dataset
+    feature_columns = [col for col in top_features if col in filtered_df.columns]
+    if len(feature_columns) < len(top_features):
+        print(f"Warning: Only found {len(feature_columns)}/{len(top_features)} features in the dataset")
+        print(f"Missing features: {set(top_features) - set(feature_columns)}")
+
+    # Get feature data
+    X = filtered_df[feature_columns].copy()
+    y = filtered_df['target']
+
+    # Print class distribution
+    print("\nClass distribution:")
+    print(f"Class 0 (Aggregate): {(y == 0).sum()} ({(y == 0).mean():.2%})")
+    print(f"Class 1 (Embedded): {(y == 1).sum()} ({(y == 1).mean():.2%})")
+    print(f"Imbalance ratio: 1:{(y == 1).sum() / (y == 0).sum():.1f}")
+
+    # Split into train, validation, and test sets (60/20/20)
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.4, random_state=RANDOM_STATE, stratify=y
     )
-    feature_names = [f'feature_{i}' for i in range(X.shape[1])]
-    X = pd.DataFrame(X, columns=feature_names)
-    y = pd.Series(y, name='target')
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=RANDOM_STATE, stratify=y_temp
+    )
 
-    return X, y
+    print(f"Training set: {X_train.shape[0]} samples")
+    print(f"Validation set: {X_val.shape[0]} samples")
+    print(f"Test set: {X_test.shape[0]} samples")
+
+    return X_train, X_val, X_test, y_train, y_val, y_test, feature_columns
 
 
 # Function to preprocess data
 def preprocess_data(X_train, X_val, X_test):
     """Apply preprocessing to features."""
+    print("Preprocessing data...")
+
     # Impute missing values
     imputer = SimpleImputer(strategy='median')
     X_train_imputed = imputer.fit_transform(X_train)
@@ -82,177 +112,296 @@ def preprocess_data(X_train, X_val, X_test):
     return X_train_processed, X_val_processed, X_test_processed, imputer, scaler
 
 
+# Function to calculate specificity
+def specificity_score(y_true, y_pred):
+    """Calculate specificity (true negative rate)."""
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return tn / (tn + fp)
+
+
 # Function to evaluate a model
 def evaluate_model(model, X_train, X_val, X_test, y_train, y_val, y_test, model_name):
-    """Evaluate model with comprehensive metrics."""
-    results = {}
+    """Train and evaluate a model, returning the trained model and results."""
+    # Start timer
     start_time = time()
 
     # Train the model
     model.fit(X_train, y_train)
+
+    # Calculate training time
     training_time = time() - start_time
-    results['training_time'] = training_time
+    print(f"Training completed in {training_time:.2f} seconds")
 
     # Make predictions
-    start_time = time()
     y_train_pred = model.predict(X_train)
     y_val_pred = model.predict(X_val)
     y_test_pred = model.predict(X_test)
 
-    y_train_proba = model.predict_proba(X_train)[:, 1]
-    y_val_proba = model.predict_proba(X_val)[:, 1]
-    y_test_proba = model.predict_proba(X_test)[:, 1]
-    prediction_time = time() - start_time
-    results['prediction_time'] = prediction_time
+    # Predict probabilities
+    if hasattr(model, "predict_proba"):
+        y_train_proba = model.predict_proba(X_train)[:, 1]
+        y_val_proba = model.predict_proba(X_val)[:, 1]
+        y_test_proba = model.predict_proba(X_test)[:, 1]
+    else:
+        y_train_proba = y_train_pred
+        y_val_proba = y_val_pred
+        y_test_proba = y_test_pred
 
-    # Calculate metrics for each dataset
-    datasets = {
-        'train': (y_train, y_train_pred, y_train_proba),
-        'val': (y_val, y_val_pred, y_val_proba),
-        'test': (y_test, y_test_pred, y_test_proba)
-    }
+    # Calculate metrics
+    results = {}
+    results['training_time'] = training_time
 
-    for dataset_name, (y_true, y_pred, y_proba) in datasets.items():
-        results[f'{dataset_name}_accuracy'] = accuracy_score(y_true, y_pred)
-        results[f'{dataset_name}_precision'] = precision_score(y_true, y_pred)
-        results[f'{dataset_name}_recall'] = recall_score(y_true, y_pred)
-        results[f'{dataset_name}_f1'] = f1_score(y_true, y_pred)
-        results[f'{dataset_name}_roc_auc'] = roc_auc_score(y_true, y_proba)
-        results[f'{dataset_name}_avg_precision'] = average_precision_score(y_true, y_proba)
-        results[f'{dataset_name}_log_loss'] = log_loss(y_true, y_proba)
-        results[f'{dataset_name}_brier_score'] = brier_score_loss(y_true, y_proba)
-        results[f'{dataset_name}_matthews_corrcoef'] = matthews_corrcoef(y_true, y_pred)
-        results[f'{dataset_name}_cohen_kappa'] = cohen_kappa_score(y_true, y_pred)
+    # Common classification metrics
+    for name, y_true, y_pred, y_proba in [
+        ('train', y_train, y_train_pred, y_train_proba),
+        ('val', y_val, y_val_pred, y_val_proba),
+        ('test', y_test, y_test_pred, y_test_proba)
+    ]:
+        results[f'{name}_accuracy'] = accuracy_score(y_true, y_pred)
+        results[f'{name}_precision'] = precision_score(y_true, y_pred)
+        results[f'{name}_recall'] = recall_score(y_true, y_pred)  # Sensitivity
+        results[f'{name}_specificity'] = specificity_score(y_true, y_pred)
+        results[f'{name}_f1'] = f1_score(y_true, y_pred)
+        results[f'{name}_roc_auc'] = roc_auc_score(y_true, y_proba)
+        results[f'{name}_avg_precision'] = average_precision_score(y_true, y_proba)
+        results[f'{name}_log_loss'] = log_loss(y_true, y_proba)
+        results[f'{name}_brier_score'] = brier_score_loss(y_true, y_proba)
+        results[f'{name}_matthews_corrcoef'] = matthews_corrcoef(y_true, y_pred)
+        results[f'{name}_cohen_kappa'] = cohen_kappa_score(y_true, y_pred)
 
-        # Confusion matrix components
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-        results[f'{dataset_name}_true_negatives'] = tn
-        results[f'{dataset_name}_false_positives'] = fp
-        results[f'{dataset_name}_false_negatives'] = fn
-        results[f'{dataset_name}_true_positives'] = tp
-        results[f'{dataset_name}_specificity'] = tn / (tn + fp) if (tn + fp) > 0 else 0
+    # Print results summary
+    print(f"\n{model_name} Performance:")
+    print(
+        f"Training - Accuracy: {results['train_accuracy']:.4f}, ROC-AUC: {results['train_roc_auc']:.4f}, F1: {results['train_f1']:.4f}")
+    print(
+        f"Validation - Accuracy: {results['val_accuracy']:.4f}, ROC-AUC: {results['val_roc_auc']:.4f}, F1: {results['val_f1']:.4f}")
+    print(
+        f"Test - Accuracy: {results['test_accuracy']:.4f}, ROC-AUC: {results['test_roc_auc']:.4f}, F1: {results['test_f1']:.4f}")
+    print(
+        f"Test - Precision: {results['test_precision']:.4f}, Recall: {results['test_recall']:.4f}, Specificity: {results['test_specificity']:.4f}")
 
-    # Print key results
-    print(f"\n{model_name} Results:")
-    print(f"Training Time: {training_time:.2f} seconds")
-    print(f"Validation Accuracy: {results['val_accuracy']:.4f}")
-    print(f"Validation ROC AUC: {results['val_roc_auc']:.4f}")
-    print(f"Validation F1 Score: {results['val_f1']:.4f}")
-    print(f"Test Accuracy: {results['test_accuracy']:.4f}")
-    print(f"Test ROC AUC: {results['test_roc_auc']:.4f}")
-    print(f"Test F1 Score: {results['test_f1']:.4f}")
+    # Save confusion matrix visualization
+    plt.figure(figsize=(8, 7))
+    cm = confusion_matrix(y_test, y_test_pred)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False)
+    plt.title(f'{model_name} - Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{model_name.replace(' ', '_').lower()}_confusion_matrix.png"))
+    plt.close()
 
-    # Create visualizations
-    create_model_visualizations(
-        model_name,
-        y_test,
-        y_test_pred,
-        y_test_proba,
-        model,
-        X_test
-    )
+    # Save ROC curve
+    plt.figure(figsize=(8, 7))
+    fpr, tpr, _ = roc_curve(y_test, y_test_proba)
+    plt.plot(fpr, tpr, lw=2, label=f'{model_name} (AUC = {results["test_roc_auc"]:.4f})')
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'{model_name} - ROC Curve')
+    plt.legend(loc='lower right')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{model_name.replace(' ', '_').lower()}_roc_curve.png"))
+    plt.close()
+
+    # Save Precision-Recall curve
+    plt.figure(figsize=(8, 7))
+    precision, recall, _ = precision_recall_curve(y_test, y_test_proba)
+    plt.plot(recall, precision, lw=2, label=f'{model_name} (AP = {results["test_avg_precision"]:.4f})')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title(f'{model_name} - Precision-Recall Curve')
+    plt.legend(loc='best')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{model_name.replace(' ', '_').lower()}_pr_curve.png"))
+    plt.close()
+
+    # Save calibration curve
+    plt.figure(figsize=(8, 7))
+    prob_true, prob_pred = calibration_curve(y_test, y_test_proba, n_bins=10)
+    plt.plot(prob_pred, prob_true, 's-', label=model_name)
+    plt.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated')
+    plt.xlabel('Mean predicted probability')
+    plt.ylabel('Fraction of positives')
+    plt.title(f'{model_name} - Calibration Curve')
+    plt.legend(loc='best')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{model_name.replace(' ', '_').lower()}_calibration_curve.png"))
+    plt.close()
+
+    # For tree-based models, plot feature importance
+    if hasattr(model, 'feature_importances_'):
+        # Get feature importance
+        if model_name == 'XGBoost':
+            importances = model.get_booster().get_score(importance_type='gain')
+            importances = {X_train.columns[i]: importances.get(f'f{i}', 0) for i in range(len(X_train.columns))}
+        else:
+            importances = {feature: importance for feature, importance in
+                           zip(X_train.columns, model.feature_importances_)}
+
+        # Convert to dataframe and sort
+        imp_df = pd.DataFrame({'Feature': list(importances.keys()), 'Importance': list(importances.values())})
+        imp_df = imp_df.sort_values('Importance', ascending=False)
+
+        # Plot feature importance
+        plt.figure(figsize=(10, 8))
+        plt.barh(imp_df['Feature'][:15], imp_df['Importance'][:15])
+        plt.gca().invert_yaxis()
+        plt.title(f'{model_name} - Top 15 Feature Importance')
+        plt.xlabel('Importance')
+        plt.ylabel('Feature')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"{model_name.replace(' ', '_').lower()}_feature_importance.png"))
+        plt.close()
+
+        # Save feature importance
+        imp_df.to_csv(os.path.join(output_dir, f"{model_name.replace(' ', '_').lower()}_feature_importance.csv"),
+                      index=False)
 
     return model, results
 
 
-# Function to create visualizations
-def create_model_visualizations(model_name, y_true, y_pred, y_pred_proba, model, X_test):
-    """Create and save visualizations for model evaluation."""
-    # Create a figure with multiple subplots
-    fig, axes = plt.subplots(2, 2, figsize=(20, 16))
-    fig.suptitle(f"{model_name} Performance Evaluation", fontsize=16)
+# Function to create comparison visualizations for all models
+def create_comparison_visualizations(results_df, X_test, y_test, trained_models):
+    """Create visualizations comparing all models."""
+    # 1. Compare model performance metrics
+    metrics_to_plot = ['accuracy', 'precision', 'recall', 'specificity', 'f1', 'roc_auc']
 
-    # 1. Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred)
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=axes[0, 0])
-    axes[0, 0].set_title("Confusion Matrix")
-    axes[0, 0].set_xlabel("Predicted Label")
-    axes[0, 0].set_ylabel("True Label")
-
-    # 2. ROC Curve
-    fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
-    roc_auc = roc_auc_score(y_true, y_pred_proba)
-    axes[0, 1].plot(fpr, tpr, label=f'ROC curve (area = {roc_auc:.3f})')
-    axes[0, 1].plot([0, 1], [0, 1], 'k--')
-    axes[0, 1].set_xlim([0.0, 1.0])
-    axes[0, 1].set_ylim([0.0, 1.05])
-    axes[0, 1].set_xlabel('False Positive Rate')
-    axes[0, 1].set_ylabel('True Positive Rate')
-    axes[0, 1].set_title('Receiver Operating Characteristic')
-    axes[0, 1].legend(loc="lower right")
-
-    # 3. Precision-Recall Curve
-    precision, recall, _ = precision_recall_curve(y_true, y_pred_proba)
-    avg_precision = average_precision_score(y_true, y_pred_proba)
-    axes[1, 0].plot(recall, precision, label=f'Precision-Recall curve (AP = {avg_precision:.3f})')
-    axes[1, 0].set_xlabel('Recall')
-    axes[1, 0].set_ylabel('Precision')
-    axes[1, 0].set_title('Precision-Recall Curve')
-    axes[1, 0].legend(loc="lower left")
-
-    # 4. Calibration Curve
-    prob_true, prob_pred = calibration_curve(y_true, y_pred_proba, n_bins=10)
-    axes[1, 1].plot(prob_pred, prob_true, marker='o', linewidth=1)
-    axes[1, 1].plot([0, 1], [0, 1], 'k--')
-    axes[1, 1].set_xlabel('Mean Predicted Probability')
-    axes[1, 1].set_ylabel('Fraction of Positives')
-    axes[1, 1].set_title('Calibration Curve')
-
-    # Adjust layout and save
-    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Make room for the suptitle
-    plt.savefig(os.path.join(output_dir, f"{model_name.replace(' ', '_').lower()}_evaluation.png"))
+    plt.figure(figsize=(14, 10))
+    results_df[metrics_to_plot].plot(kind='bar', figsize=(14, 8))
+    plt.title('Model Performance Comparison')
+    plt.xlabel('Model')
+    plt.ylabel('Score')
+    plt.ylim(0, 1.05)
+    plt.grid(axis='y')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "model_performance_comparison.png"))
     plt.close()
 
-    # Feature importance (if available)
-    try:
-        if hasattr(model, 'feature_importances_'):
-            # Get feature importances
-            importances = model.feature_importances_
-            feature_names = X_test.columns
-            indices = np.argsort(importances)[::-1]
+    # 2. Compare ROC curves
+    plt.figure(figsize=(10, 8))
+    for model_name, model in trained_models.items():
+        if hasattr(model, 'predict_proba'):
+            y_proba = model.predict_proba(X_test)[:, 1]
+            fpr, tpr, _ = roc_curve(y_test, y_proba)
+            plt.plot(fpr, tpr, lw=2, label=f'{model_name} (AUC = {results_df.loc[model_name, "roc_auc"]:.4f})')
 
-            # Plot feature importances
-            plt.figure(figsize=(12, 8))
-            plt.title(f'Feature Importances: {model_name}')
-            plt.bar(range(min(20, len(indices))), importances[indices[:20]], align='center')
-            plt.xticks(range(min(20, len(indices))), [feature_names[i] for i in indices[:20]], rotation=90)
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, f"{model_name.replace(' ', '_').lower()}_feature_importance.png"))
-            plt.close()
-    except:
-        print(f"Could not generate feature importance plot for {model_name}")
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve Comparison')
+    plt.legend(loc='lower right')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "roc_curve_comparison.png"))
+    plt.close()
+
+    # 3. Compare Precision-Recall curves
+    plt.figure(figsize=(10, 8))
+    for model_name, model in trained_models.items():
+        if hasattr(model, 'predict_proba'):
+            y_proba = model.predict_proba(X_test)[:, 1]
+            precision, recall, _ = precision_recall_curve(y_test, y_proba)
+            plt.plot(recall, precision, lw=2,
+                     label=f'{model_name} (AP = {results_df.loc[model_name, "avg_precision"]:.4f})')
+
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve Comparison')
+    plt.legend(loc='best')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "precision_recall_comparison.png"))
+    plt.close()
+
+    # 4. Compare calibration curves
+    plt.figure(figsize=(10, 8))
+    for model_name, model in trained_models.items():
+        if hasattr(model, 'predict_proba'):
+            y_proba = model.predict_proba(X_test)[:, 1]
+            prob_true, prob_pred = calibration_curve(y_test, y_proba, n_bins=10)
+            plt.plot(prob_pred, prob_true, 's-', label=model_name)
+
+    plt.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated')
+    plt.xlabel('Mean predicted probability')
+    plt.ylabel('Fraction of positives')
+    plt.title('Calibration Curve Comparison')
+    plt.legend(loc='best')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "calibration_curve_comparison.png"))
+    plt.close()
+
+    # 5. Radar chart of key metrics
+    metrics = ['accuracy', 'precision', 'recall', 'specificity', 'f1', 'roc_auc']
+
+    # Set up the radar chart
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, polar=True)
+
+    # Compute angle for each metric
+    angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False).tolist()
+    angles += angles[:1]  # Close the polygon
+
+    # Plot each model
+    for model_name in results_df.index:
+        values = results_df.loc[model_name, metrics].values.tolist()
+        values += values[:1]  # Close the polygon
+        ax.plot(angles, values, linewidth=2, label=model_name)
+        ax.fill(angles, values, alpha=0.1)
+
+    # Set chart labels
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(metrics)
+    ax.set_yticklabels([])
+    ax.set_ylim(0, 1)
+
+    # Add grid and legend
+    ax.grid(True)
+    plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
+    plt.title('Model Comparison - Radar Chart')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "model_radar_chart.png"))
+    plt.close()
 
 
 # Main execution function
-def run_ensemble_models(data_file='data.csv'):
+def run_ensemble_models(data_file=None):
     """Run and evaluate multiple ensemble models."""
 
     # 1. Load and split data
     print("Loading and preparing data...")
-    X, y = load_data(data_file)
-
-    # Split into train, validation, and test sets (60/20/20)
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X, y, test_size=0.4, random_state=RANDOM_STATE, stratify=y
-    )
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.5, random_state=RANDOM_STATE, stratify=y_temp
-    )
-
-    print(
-        f"Training set: {X_train.shape[0]} samples, Validation set: {X_val.shape[0]} samples, Test set: {X_test.shape[0]} samples")
+    X_train, X_val, X_test, y_train, y_val, y_test, features = load_data(data_file)
 
     # 2. Preprocess data
-    print("Preprocessing data...")
+    print("\nPreprocessing data...")
     X_train_processed, X_val_processed, X_test_processed, imputer, scaler = preprocess_data(
         X_train, X_val, X_test
     )
+
+    # Save preprocessed datasets for future use
+    print("\nSaving preprocessed datasets...")
+    train_data = pd.concat([X_train_processed, y_train], axis=1)
+    val_data = pd.concat([X_val_processed, y_val], axis=1)
+    test_data = pd.concat([X_test_processed, y_test], axis=1)
+
+    train_data.to_csv(os.path.join(output_dir, "train_data_top20.csv"), index=False)
+    val_data.to_csv(os.path.join(output_dir, "val_data_top20.csv"), index=False)
+    test_data.to_csv(os.path.join(output_dir, "test_data_top20.csv"), index=False)
 
     # Save preprocessors
     joblib.dump(imputer, os.path.join(output_dir, 'imputer.joblib'))
     joblib.dump(scaler, os.path.join(output_dir, 'scaler.joblib'))
 
-    # 3. Define models
+    # Calculate class imbalance ratio for setting appropriate weights
+    imbalance_ratio = (y_train == 1).sum() / (y_train == 0).sum()
+    print(f"Class imbalance ratio in training set: 1:{imbalance_ratio:.2f}")
+
+    # 3. Define models with appropriate class imbalance handling
     models = {
         'Random Forest': RandomForestClassifier(
             n_estimators=1000,
@@ -261,6 +410,7 @@ def run_ensemble_models(data_file='data.csv'):
             min_samples_leaf=1,
             max_features='sqrt',
             bootstrap=True,
+            class_weight='balanced',  # Handle class imbalance
             n_jobs=-1,
             random_state=RANDOM_STATE
         ),
@@ -282,7 +432,7 @@ def run_ensemble_models(data_file='data.csv'):
             subsample=0.8,
             colsample_bytree=0.8,
             objective='binary:logistic',
-            scale_pos_weight=1,
+            scale_pos_weight=imbalance_ratio,  # Set based on actual class ratio
             tree_method='hist',
             n_jobs=-1,
             random_state=RANDOM_STATE
@@ -295,6 +445,7 @@ def run_ensemble_models(data_file='data.csv'):
             min_child_samples=20,
             subsample=0.8,
             colsample_bytree=0.8,
+            class_weight='balanced',  # Handle class imbalance
             n_jobs=-1,
             random_state=RANDOM_STATE
         ),
@@ -303,6 +454,7 @@ def run_ensemble_models(data_file='data.csv'):
             learning_rate=0.05,
             depth=10,
             loss_function='Logloss',
+            auto_class_weights='Balanced',  # Handle class imbalance
             verbose=False,
             random_seed=RANDOM_STATE
         )
@@ -352,78 +504,10 @@ def run_ensemble_models(data_file='data.csv'):
     return results_df, trained_models
 
 
-# Function to create comparison visualizations
-def create_comparison_visualizations(results_df, X_test, y_test, models):
-    """Create visualizations comparing all models."""
-
-    # 1. Performance metrics comparison
-    metrics_to_plot = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc']
-
-    # Plot bar chart for each metric
-    plt.figure(figsize=(15, 10))
-
-    for i, metric in enumerate(metrics_to_plot):
-        plt.subplot(2, 3, i + 1)
-        results_df[metric].sort_values().plot(kind='bar', color='skyblue')
-        plt.title(f'{metric.replace("_", " ").title()}')
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-
-    plt.savefig(os.path.join(output_dir, 'metrics_comparison.png'))
-    plt.close()
-
-    # 2. ROC curves comparison
-    plt.figure(figsize=(12, 10))
-
-    for model_name, model in models.items():
-        y_pred_proba = model.predict_proba(X_test)[:, 1]
-        fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
-        roc_auc = roc_auc_score(y_test, y_pred_proba)
-        plt.plot(fpr, tpr, label=f'{model_name} (AUC = {roc_auc:.3f})')
-
-    plt.plot([0, 1], [0, 1], 'k--')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curves Comparison')
-    plt.legend(loc='lower right')
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(output_dir, 'roc_curves_comparison.png'))
-    plt.close()
-
-    # 3. Precision-Recall curves comparison
-    plt.figure(figsize=(12, 10))
-
-    for model_name, model in models.items():
-        y_pred_proba = model.predict_proba(X_test)[:, 1]
-        precision, recall, _ = precision_recall_curve(y_test, y_pred_proba)
-        avg_precision = average_precision_score(y_test, y_pred_proba)
-        plt.plot(recall, precision, label=f'{model_name} (AP = {avg_precision:.3f})')
-
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title('Precision-Recall Curves Comparison')
-    plt.legend(loc='lower left')
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(output_dir, 'pr_curves_comparison.png'))
-    plt.close()
-
-    # 4. Training time comparison
-    plt.figure(figsize=(12, 6))
-    results_df['training_time'].sort_values().plot(kind='bar', color='lightgreen')
-    plt.title('Training Time Comparison (seconds)')
-    plt.ylabel('Time (seconds)')
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'training_time_comparison.png'))
-    plt.close()
-
-
-# Execute the analysis
+# Execute the analysis if run as a script
 if __name__ == "__main__":
-    results_df, trained_models = run_ensemble_models()
-    print("\nAnalysis complete. Results saved to:", output_dir)
-
-    # Display final results summary
-    print("\nFinal Model Comparison (Test Set Metrics):")
-    display_cols = ['accuracy', 'roc_auc', 'f1', 'precision', 'recall']
-    print(results_df[display_cols].sort_values('roc_auc', ascending=False))
+    results, models = run_ensemble_models()
+    print("\nAnalysis complete!")
+    print("\nTop performing model by ROC-AUC:")
+    top_model = results.sort_values('roc_auc', ascending=False).index[0]
+    print(f"{top_model} - ROC-AUC: {results.loc[top_model, 'roc_auc']:.4f}")
