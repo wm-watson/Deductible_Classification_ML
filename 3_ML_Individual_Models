@@ -34,8 +34,8 @@ os.makedirs(output_dir, exist_ok=True)
 
 
 # Function to load data from the original dataset using the top 20 features
-def load_data(file_path=None):
-    """Load data using the top 20 features from feature importance results."""
+def load_data(file_path=None, balance_classes=True):
+    """Load data using the top 20 features from feature importance results with class balancing."""
     print("Building dataset from top 20 features...")
 
     # Load the feature importance results
@@ -56,6 +56,40 @@ def load_data(file_path=None):
     filtered_df = claim_df[mask].copy()
     filtered_df['target'] = (filtered_df['DEDUCTIBLE_CATEGORY_first'] == 'Embedded').astype(int)
 
+    # Print original class distribution
+    print("\nOriginal class distribution:")
+    print(f"Class 0 (Aggregate): {(filtered_df['target'] == 0).sum()} ({(filtered_df['target'] == 0).mean():.2%})")
+    print(f"Class 1 (Embedded): {(filtered_df['target'] == 1).sum()} ({(filtered_df['target'] == 1).mean():.2%})")
+    print(f"Original imbalance ratio: 1:{(filtered_df['target'] == 1).sum() / (filtered_df['target'] == 0).sum():.1f}")
+
+    # Balance classes if requested
+    if balance_classes:
+        print("\nBalancing classes through undersampling...")
+
+        # Separate minority and majority classes
+        aggregate_df = filtered_df[filtered_df['target'] == 0]
+        embedded_df = filtered_df[filtered_df['target'] == 1]
+
+        # Undersample majority class (embedded)
+        # Using a 1:1 ratio, but you can adjust as needed (e.g., 1:2, 1:3)
+        n_aggregate = len(aggregate_df)
+        embedded_undersampled = embedded_df.sample(n=n_aggregate, random_state=RANDOM_STATE)
+
+        # Combine undersampled majority with minority
+        balanced_df = pd.concat([aggregate_df, embedded_undersampled])
+
+        # Shuffle the balanced dataset
+        balanced_df = balanced_df.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
+
+        # Use the balanced dataset
+        filtered_df = balanced_df
+
+        # Print balanced class distribution
+        print("\nBalanced class distribution:")
+        print(f"Class 0 (Aggregate): {(filtered_df['target'] == 0).sum()} ({(filtered_df['target'] == 0).mean():.2%})")
+        print(f"Class 1 (Embedded): {(filtered_df['target'] == 1).sum()} ({(filtered_df['target'] == 1).mean():.2%})")
+        print(f"New balanced ratio: 1:{(filtered_df['target'] == 1).sum() / (filtered_df['target'] == 0).sum():.1f}")
+
     # Make sure all top features exist in the dataset
     feature_columns = [col for col in top_features if col in filtered_df.columns]
     if len(feature_columns) < len(top_features):
@@ -66,12 +100,6 @@ def load_data(file_path=None):
     X = filtered_df[feature_columns].copy()
     y = filtered_df['target']
 
-    # Print class distribution
-    print("\nClass distribution:")
-    print(f"Class 0 (Aggregate): {(y == 0).sum()} ({(y == 0).mean():.2%})")
-    print(f"Class 1 (Embedded): {(y == 1).sum()} ({(y == 1).mean():.2%})")
-    print(f"Imbalance ratio: 1:{(y == 1).sum() / (y == 0).sum():.1f}")
-
     # Split into train, validation, and test sets (60/20/20)
     X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, test_size=0.4, random_state=RANDOM_STATE, stratify=y
@@ -80,6 +108,7 @@ def load_data(file_path=None):
         X_temp, y_temp, test_size=0.5, random_state=RANDOM_STATE, stratify=y_temp
     )
 
+    print(f"\nSplit data:")
     print(f"Training set: {X_train.shape[0]} samples")
     print(f"Validation set: {X_val.shape[0]} samples")
     print(f"Test set: {X_test.shape[0]} samples")
@@ -370,12 +399,12 @@ def create_comparison_visualizations(results_df, X_test, y_test, trained_models)
 
 
 # Main execution function
-def run_ensemble_models(data_file=None):
+def run_ensemble_models(data_file=None, balance_classes=True):
     """Run and evaluate multiple ensemble models."""
 
     # 1. Load and split data
     print("Loading and preparing data...")
-    X_train, X_val, X_test, y_train, y_val, y_test, features = load_data(data_file)
+    X_train, X_val, X_test, y_train, y_val, y_test, features = load_data(data_file, balance_classes=balance_classes)
 
     # 2. Preprocess data
     print("\nPreprocessing data...")
@@ -402,6 +431,7 @@ def run_ensemble_models(data_file=None):
     print(f"Class imbalance ratio in training set: 1:{imbalance_ratio:.2f}")
 
     # 3. Define models with appropriate class imbalance handling
+    # Note: We can still use class weights even with balanced data for robustness
     models = {
         'Random Forest': RandomForestClassifier(
             n_estimators=1000,
@@ -506,7 +536,7 @@ def run_ensemble_models(data_file=None):
 
 # Execute the analysis if run as a script
 if __name__ == "__main__":
-    results, models = run_ensemble_models()
+    results, models = run_ensemble_models(balance_classes=True)
     print("\nAnalysis complete!")
     print("\nTop performing model by ROC-AUC:")
     top_model = results.sort_values('roc_auc', ascending=False).index[0]

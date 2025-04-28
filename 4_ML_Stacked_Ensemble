@@ -35,8 +35,8 @@ os.makedirs(output_dir, exist_ok=True)
 
 
 # Function to load data from the original dataset using the top 20 features
-def load_data(file_path=None):
-    """Load data using the top 20 features from feature importance results."""
+def load_data(file_path=None, balance_classes=True):
+    """Load data using the top 20 features from feature importance results with class balancing."""
     print("Building dataset from top 20 features...")
 
     # Load the feature importance results
@@ -57,6 +57,40 @@ def load_data(file_path=None):
     filtered_df = claim_df[mask].copy()
     filtered_df['target'] = (filtered_df['DEDUCTIBLE_CATEGORY_first'] == 'Embedded').astype(int)
 
+    # Print original class distribution
+    print("\nOriginal class distribution:")
+    print(f"Class 0 (Aggregate): {(filtered_df['target'] == 0).sum()} ({(filtered_df['target'] == 0).mean():.2%})")
+    print(f"Class 1 (Embedded): {(filtered_df['target'] == 1).sum()} ({(filtered_df['target'] == 1).mean():.2%})")
+    print(f"Original imbalance ratio: 1:{(filtered_df['target'] == 1).sum() / (filtered_df['target'] == 0).sum():.1f}")
+
+    # Balance classes if requested
+    if balance_classes:
+        print("\nBalancing classes through undersampling...")
+
+        # Separate minority and majority classes
+        aggregate_df = filtered_df[filtered_df['target'] == 0]
+        embedded_df = filtered_df[filtered_df['target'] == 1]
+
+        # Undersample majority class (embedded)
+        # Using a 1:1 ratio, but you can adjust as needed (e.g., 1:2, 1:3)
+        n_aggregate = len(aggregate_df)
+        embedded_undersampled = embedded_df.sample(n=n_aggregate, random_state=RANDOM_STATE)
+
+        # Combine undersampled majority with minority
+        balanced_df = pd.concat([aggregate_df, embedded_undersampled])
+
+        # Shuffle the balanced dataset
+        balanced_df = balanced_df.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
+
+        # Use the balanced dataset
+        filtered_df = balanced_df
+
+        # Print balanced class distribution
+        print("\nBalanced class distribution:")
+        print(f"Class 0 (Aggregate): {(filtered_df['target'] == 0).sum()} ({(filtered_df['target'] == 0).mean():.2%})")
+        print(f"Class 1 (Embedded): {(filtered_df['target'] == 1).sum()} ({(filtered_df['target'] == 1).mean():.2%})")
+        print(f"New balanced ratio: 1:{(filtered_df['target'] == 1).sum() / (filtered_df['target'] == 0).sum():.1f}")
+
     # Make sure all top features exist in the dataset
     feature_columns = [col for col in top_features if col in filtered_df.columns]
     if len(feature_columns) < len(top_features):
@@ -67,12 +101,6 @@ def load_data(file_path=None):
     X = filtered_df[feature_columns].copy()
     y = filtered_df['target']
 
-    # Print class distribution
-    print("\nClass distribution:")
-    print(f"Class 0 (Aggregate): {(y == 0).sum()} ({(y == 0).mean():.2%})")
-    print(f"Class 1 (Embedded): {(y == 1).sum()} ({(y == 1).mean():.2%})")
-    print(f"Imbalance ratio: 1:{(y == 1).sum() / (y == 0).sum():.1f}")
-
     # Split into train, validation, and test sets (60/20/20)
     X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, test_size=0.4, random_state=RANDOM_STATE, stratify=y
@@ -81,6 +109,7 @@ def load_data(file_path=None):
         X_temp, y_temp, test_size=0.5, random_state=RANDOM_STATE, stratify=y_temp
     )
 
+    print(f"\nSplit data:")
     print(f"Training set: {X_train.shape[0]} samples")
     print(f"Validation set: {X_val.shape[0]} samples")
     print(f"Test set: {X_test.shape[0]} samples")
@@ -127,52 +156,58 @@ def build_stacked_model(X_train, X_val, X_test, y_train, y_val, y_test):
 
     # Calculate imbalance ratio for setting weights
     imbalance_ratio = (y_train == 1).sum() / (y_train == 0).sum()
+    print(f"Class imbalance ratio in training set: 1:{imbalance_ratio:.2f}")
 
-    # 1. Define base models with class imbalance handling
+    # 1. Define simplified base models with class imbalance handling
     base_models = [
         ('rf', RandomForestClassifier(
-            n_estimators=500,
+            n_estimators=100,
+            max_depth=6,
             class_weight='balanced',
             n_jobs=-1,
             random_state=RANDOM_STATE
         )),
         ('gb', GradientBoostingClassifier(
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=8,
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=6,
+            subsample=0.8,
             random_state=RANDOM_STATE
         )),
         ('xgb', xgb.XGBClassifier(
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=10,
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=6,
             scale_pos_weight=imbalance_ratio,
+            # Remove early_stopping_rounds - it can't be used within StackingClassifier
             n_jobs=-1,
             random_state=RANDOM_STATE
         )),
         ('lgb', lgb.LGBMClassifier(
-            n_estimators=500,
-            learning_rate=0.05,
-            num_leaves=128,
+            n_estimators=50,
+            learning_rate=0.1,
+            num_leaves=31,
             class_weight='balanced',
+            # Remove early_stopping_rounds - it can't be used within StackingClassifier
+            verbose=-1,
             n_jobs=-1,
             random_state=RANDOM_STATE
         ))
     ]
 
-    # 2. Define meta-learner (final estimator)
+    # 2. Define simplified meta-learner (final estimator)
     meta_learner = LogisticRegression(
-        C=0.1,
+        C=1.0,
         class_weight='balanced',
         solver='liblinear',
         random_state=RANDOM_STATE
     )
 
-    # 3. Create and train stacked model
+    # 3. Create and train stacked model with reduced CV
     stacked_model = StackingClassifier(
         estimators=base_models,
         final_estimator=meta_learner,
-        cv=5,
+        cv=3,
         stack_method='predict_proba',
         n_jobs=-1
     )
@@ -416,12 +451,12 @@ def analyze_predictions(model, X_test, y_test):
 
 
 # Main execution function for stacked model
-def run_stacked_ensemble_analysis(data_file=None):
+def run_stacked_ensemble_analysis(data_file=None, balance_classes=True):
     """Run stacked ensemble analysis and evaluation."""
 
     # 1. Load the pre-split datasets
     print("Loading and preparing data...")
-    X_train, X_val, X_test, y_train, y_val, y_test, features = load_data(data_file)
+    X_train, X_val, X_test, y_train, y_val, y_test, features = load_data(data_file, balance_classes=balance_classes)
 
     print(
         f"Training set: {X_train.shape[0]} samples, Validation set: {X_val.shape[0]} samples, Test set: {X_test.shape[0]} samples")
@@ -455,7 +490,7 @@ def run_stacked_ensemble_analysis(data_file=None):
 
 # Execute the analysis if run as a script
 if __name__ == "__main__":
-    stacked_model, results = run_stacked_ensemble_analysis()
+    stacked_model, results = run_stacked_ensemble_analysis(balance_classes=True)
     print("\nStacked ensemble analysis complete!")
 
     # Print key test metrics
